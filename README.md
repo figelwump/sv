@@ -1,6 +1,8 @@
 # sv — simple secret vault
 
-Local dev secret management for macOS. Stores secrets in Keychain, injects them into processes on demand.
+Local dev secret management for macOS. Stores secrets in the Keychain, injects them into processes on demand.
+
+No files, no databases, no daemon. One script, one command prefix: `sv exec --`.
 
 ## Install
 
@@ -24,14 +26,14 @@ sv update
 ## Quick start
 
 ```bash
-# Store secrets (always prompts — never pass values as arguments)
+# Store secrets (always prompts — values never touch shell history)
 sv set OPENAI_API_KEY
 sv set ANTHROPIC_API_KEY
 
 # Or pipe from another source
 echo "sk-proj-..." | sv set OPENAI_API_KEY
 
-# List stored secrets (names only, never values)
+# List stored secret names (never values)
 sv ls
 
 # Run any command with secrets injected
@@ -42,7 +44,7 @@ sv exec -- pytest
 
 ## How it works
 
-Secrets are stored in the macOS Keychain under the service prefix `sv:`. No files, no databases, no daemon. The `security` CLI does the heavy lifting.
+Secrets are stored in the macOS Keychain under the service prefix `sv:`. The native `security` CLI does the heavy lifting — your secrets are encrypted at rest and survive reboots.
 
 `sv exec -- <cmd>` resolves secrets and injects them as environment variables into the subprocess. The calling process (or agent) never sees the values.
 
@@ -51,36 +53,42 @@ Secrets are stored in the macOS Keychain under the service prefix `sv:`. No file
 Create a `.secrets` file in your project root listing the secret names it needs:
 
 ```
-# .secrets — commit this, no values here
+# .secrets — commit this file, it contains no values
 OPENAI_API_KEY
 DATABASE_URL
 ```
 
-When `sv exec` runs in a directory with `.secrets` (searched up from cwd), only those secrets are injected — and it **fails if any are missing** from the keychain. Without a manifest, all stored secrets are injected.
+- When present, `sv exec` only injects listed secrets and **fails if any are missing** from the keychain.
+- When absent, all stored secrets are injected.
+- The manifest is found by searching up from the current directory, so running from a subdirectory works.
 
 ## Agent usage
 
-Agents prefix commands with `sv exec --` to run with secrets. They never see values:
+Agents prefix commands with `sv exec --` to run with secrets. They never see the actual values:
 
 ```bash
 sv exec -- npm test
 sv exec -- node scripts/call-api.js
 ```
 
-Add to your `AGENTS.md`:
+Add to your project's `AGENTS.md`:
 
 ```markdown
 ## Secrets
 
 Use `sv exec -- <command>` to run commands that need API keys or secrets.
 Never ask for or hardcode secret values. The `sv` tool injects them automatically.
+Do NOT use `sv get`, `printenv`, `env`, or `security find-generic-password` to
+read secret values. These commands exist for human use only.
 ```
 
 ## Security
 
-`sv get` is gated behind a TTY check — it refuses to print secret values when stdout is piped or captured. This prevents agents (which capture command output) from reading secrets through `sv get`.
+- **`sv set`** never accepts the value as a CLI argument — it prompts interactively or reads stdin. This keeps secrets out of shell history.
+- **`sv get`** is gated behind a TTY check — it refuses to print values when stdout is piped or captured. This blocks agents (which capture command output) from reading secrets through `sv get`.
+- **`.secrets` manifests** declare requirements by name only and are safe to commit. They scope injection so projects only get the secrets they need.
 
-This is a practical barrier, not a hard sandbox. An agent with shell access could still extract secrets through other means. The real enforcement is agent instructions — see the AGENTS.md snippet above.
+These are practical barriers, not a hard sandbox. An agent with shell access could still extract secrets through other means. The real enforcement is agent instructions.
 
 ## Commands
 
