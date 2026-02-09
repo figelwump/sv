@@ -5,8 +5,20 @@ Local dev secret management for macOS. Stores secrets in Keychain, injects them 
 ## Install
 
 ```bash
-# Symlink to somewhere on your PATH
-ln -sf "$(pwd)/sv" /usr/local/bin/sv
+curl -fsSL https://raw.githubusercontent.com/figelwump/sv/main/install.sh | bash
+```
+
+Or clone and copy manually:
+
+```bash
+git clone https://github.com/figelwump/sv.git
+cp sv/sv /usr/local/bin/sv
+```
+
+## Update
+
+```bash
+sv update
 ```
 
 ## Quick start
@@ -79,4 +91,6 @@ This is a practical barrier, not a hard sandbox. An agent with shell access coul
 | `sv rm <KEY>` | Delete a secret |
 | `sv ls` | List secret names |
 | `sv exec -- <cmd>` | Run command with secrets injected |
+| `sv update` | Update to latest version |
+| `sv version` | Print version |
 | `sv help` | Show help |

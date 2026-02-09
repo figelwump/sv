@@ -11,11 +11,16 @@
 #   sv rm <KEY>                Delete a secret
 #   sv ls                      List secret names (never values)
 #   sv exec -- <cmd> [args]    Run a command with secrets as env vars
+#   sv update                  Update sv to the latest version
+#   sv version                 Print version
 #   sv help                    Show this help
 #
 
 set -euo pipefail
 
+readonly SV_VERSION="0.1.0"
+readonly SV_REPO="figelwump/sv"
+readonly SV_RAW_URL="https://raw.githubusercontent.com/${SV_REPO}/main/sv"
 readonly SV_SERVICE_PREFIX="sv:"
 readonly SV_KEYCHAIN_ACCOUNT="${USER}"
 readonly SV_MANIFEST=".secrets"
@@ -228,6 +233,42 @@ cmd_exec() {
   exec env "${env_args[@]}" "$@"
 }
 
+cmd_update() {
+  need_cmd curl
+
+  # Find where sv is currently installed
+  local self
+  self="$(realpath "$0")"
+
+  printf "sv: updating from %s ...\n" "${SV_RAW_URL}" >&2
+
+  local tmp
+  tmp="$(mktemp)"
+  trap 'rm -f "$tmp"' EXIT
+
+  if ! curl -fsSL "${SV_RAW_URL}" -o "$tmp"; then
+    die "failed to download update"
+  fi
+
+  # Basic sanity check: must start with a shebang
+  if ! head -1 "$tmp" | grep -q '^#!/'; then
+    die "downloaded file doesn't look like a script — aborting"
+  fi
+
+  chmod +x "$tmp"
+  mv "$tmp" "$self"
+  trap - EXIT
+
+  # Show new version
+  local new_version
+  new_version="$("$self" version 2>/dev/null || echo "unknown")"
+  printf "sv: updated to %s (%s)\n" "$new_version" "$self" >&2
+}
+
+cmd_version() {
+  printf "%s\n" "${SV_VERSION}"
+}
+
 cmd_help() {
   cat <<'HELP'
 sv — simple secret vault for local dev
@@ -238,6 +279,8 @@ Usage:
   sv rm <KEY>                Delete a secret
   sv ls                      List secret names (never values)
   sv exec -- <cmd> [args]    Run a command with secrets as env vars
+  sv update                  Update sv to the latest version
+  sv version                 Print version
   sv help                    Show this help
 
 Project manifests:
@@ -286,6 +329,9 @@ case "$cmd" in
     [[ $# -eq 0 ]] && die "usage: sv exec -- <command> [args...]"
     cmd_exec "$@"
     ;;
+  update)    cmd_update ;;
+  version|--version|-v)
+    cmd_version ;;
   help|--help|-h)
     cmd_help ;;
   *)
