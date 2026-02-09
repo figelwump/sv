@@ -90,6 +90,17 @@ read secret values. These commands exist for human use only.
 
 These are practical barriers, not a hard sandbox. An agent with shell access could still extract secrets through other means. The real enforcement is agent instructions.
 
+## Testing
+
+Tests use [bats-core](https://github.com/bats-core/bats-core) and run against the real macOS Keychain in an isolated `sv_test:` namespace — no mocks, no fakes.
+
+```bash
+brew install bats-core   # one-time
+make test                # run all tests
+make test-keychain       # run a single test file
+make test-purge          # remove any orphaned test secrets
+```
+
 ## Commands
 
 | Command | Description |

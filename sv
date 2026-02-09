@@ -21,7 +21,7 @@ set -euo pipefail
 readonly SV_VERSION="0.1.0"
 readonly SV_REPO="figelwump/sv"
 readonly SV_RAW_URL="https://raw.githubusercontent.com/${SV_REPO}/main/sv"
-readonly SV_SERVICE_PREFIX="sv:"
+readonly SV_SERVICE_PREFIX="${SV_SERVICE_PREFIX:-sv:}"
 readonly SV_KEYCHAIN_ACCOUNT="${USER}"
 readonly SV_MANIFEST=".secrets"
 
