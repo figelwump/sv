@@ -6,13 +6,11 @@
 # Never stores values in files. Never prints values unless explicitly asked.
 #
 # Usage:
-#   sv set <KEY> [value]       Store a secret (prompts if no value given)
+#   sv set <KEY>               Store a secret (prompts or reads stdin)
 #   sv get <KEY>               Print a secret value
 #   sv rm <KEY>                Delete a secret
 #   sv ls                      List secret names (never values)
 #   sv exec -- <cmd> [args]    Run a command with secrets as env vars
-#   sv env                     Print export statements for eval
-#   sv shell-hook              Print shell integration code for .zshrc
 #   sv help                    Show this help
 #
 
@@ -76,6 +74,19 @@ kc_ls() {
 
 # ─── Manifest ─────────────────────────────────────────────────────────────────
 
+# Walk up from the current directory to find a .secrets manifest.
+# Returns the path if found, nothing otherwise.
+find_manifest() {
+  local dir="$PWD"
+  while [[ "$dir" != "/" ]]; do
+    if [[ -f "${dir}/${SV_MANIFEST}" ]]; then
+      printf "%s" "${dir}/${SV_MANIFEST}"
+      return
+    fi
+    dir="$(dirname "$dir")"
+  done
+}
+
 # Read secret names from a .secrets manifest file.
 # Skips blank lines and comments (#).
 read_manifest() {
@@ -95,13 +106,32 @@ read_manifest() {
 
 # ─── Resolve which secrets to inject ──────────────────────────────────────────
 
-# If a .secrets manifest exists in the current dir, use it to scope.
+# If a .secrets manifest is found (searching up from cwd), use it to scope.
 # Otherwise, inject all sv secrets.
+# Fails if a manifest lists a key not found in the keychain.
 resolve_secret_names() {
-  local manifest_keys
-  manifest_keys="$(read_manifest "${SV_MANIFEST}")"
+  local manifest_path
+  manifest_path="$(find_manifest)"
 
-  if [[ -n "${manifest_keys}" ]]; then
+  if [[ -n "${manifest_path}" ]]; then
+    local manifest_keys
+    manifest_keys="$(read_manifest "${manifest_path}")"
+    if [[ -z "${manifest_keys}" ]]; then
+      return
+    fi
+
+    # Validate every manifest key exists in the keychain
+    local missing=()
+    while IFS= read -r key; do
+      if ! kc_get "$key" >/dev/null 2>&1; then
+        missing+=("$key")
+      fi
+    done <<< "$manifest_keys"
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+      die "missing required secrets (listed in ${manifest_path}): ${missing[*]}"
+    fi
+
     printf "%s\n" "${manifest_keys}"
   else
     kc_ls
@@ -112,22 +142,31 @@ resolve_secret_names() {
 
 cmd_set() {
   local key="${1:-}"
-  local value="${2:-}"
 
-  [[ -z "$key" ]] && die "usage: sv set <KEY> [value]"
+  [[ -z "$key" ]] && die "usage: sv set <KEY>"
+
+  # Reject positional value argument to avoid shell history leakage
+  if [[ $# -gt 1 ]]; then
+    die "do not pass the value as an argument (it leaks into shell history). Use: sv set ${key}"
+  fi
 
   # Validate key looks like an env var name
   if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
     die "invalid key '${key}' — must be a valid env var name (letters, digits, underscores)"
   fi
 
-  if [[ -z "$value" ]]; then
+  local value
+  if [[ ! -t 0 ]]; then
+    # Reading from pipe/stdin
+    IFS= read -r value
+  else
+    # Interactive prompt
     printf "value for %s: " "$key" >&2
-    # Read without echo for security
     read -rs value
     printf "\n" >&2
-    [[ -z "$value" ]] && die "no value provided"
   fi
+
+  [[ -z "$value" ]] && die "no value provided"
 
   kc_set "$key" "$value"
   printf "sv: stored %s\n" "$key" >&2
@@ -160,20 +199,6 @@ cmd_ls() {
   printf "%s\n" "$keys"
 }
 
-cmd_env() {
-  local names
-  names="$(resolve_secret_names)"
-  [[ -z "$names" ]] && return
-
-  while IFS= read -r key; do
-    local value
-    value="$(kc_get "$key" 2>/dev/null)" || continue
-    # Escape single quotes in value for safe eval
-    value="${value//\'/\'\\\'\'}"
-    printf "export %s='%s'\n" "$key" "$value"
-  done <<< "$names"
-}
-
 cmd_exec() {
   # Collect env vars
   local names
@@ -196,43 +221,16 @@ cmd_exec() {
   exec env "${env_args[@]}" "$@"
 }
 
-cmd_shell_hook() {
-  cat <<'HOOK'
-# sv shell integration — add to .zshrc:
-#   eval "$(sv shell-hook)"
-sv() {
-  local sv_bin
-  sv_bin="$(command -v sv 2>/dev/null)" || { echo "sv: not found in PATH" >&2; return 1; }
-  if [[ "${1:-}" == "exec" ]]; then
-    # For exec, run directly so env vars are injected into the subprocess
-    command "$sv_bin" "$@"
-  elif [[ "${1:-}" == "env" ]]; then
-    # For env, eval the exports in the current shell
-    eval "$(command "$sv_bin" env)"
-  else
-    command "$sv_bin" "$@"
-  fi
-}
-
-# Auto-load secrets on shell startup
-if command -v sv >/dev/null 2>&1; then
-  eval "$(command sv env 2>/dev/null)"
-fi
-HOOK
-}
-
 cmd_help() {
   cat <<'HELP'
 sv — simple secret vault for local dev
 
 Usage:
-  sv set <KEY> [value]       Store a secret (prompts interactively if no value)
+  sv set <KEY>               Store a secret (prompts or reads stdin)
   sv get <KEY>               Print a secret value
   sv rm <KEY>                Delete a secret
   sv ls                      List secret names (never values)
   sv exec -- <cmd> [args]    Run a command with secrets as env vars
-  sv env                     Print export statements (for eval)
-  sv shell-hook              Print shell integration code
   sv help                    Show this help
 
 Project manifests:
@@ -242,16 +240,17 @@ Project manifests:
     OPENAI_API_KEY
     DATABASE_URL
 
-  When present, sv exec and sv env only inject listed secrets.
-  When absent, all stored secrets are injected.
+  When present, sv exec only injects listed secrets and fails if any
+  are missing from the keychain. When absent, all stored secrets are injected.
+
+  The manifest is found by searching up from the current directory.
 
 Examples:
-  sv set OPENAI_API_KEY sk-proj-...
-  sv set DATABASE_URL                     # prompts for value
-  sv ls                                   # shows: OPENAI_API_KEY, DATABASE_URL
+  sv set OPENAI_API_KEY                   # prompts for value
+  echo "sk-..." | sv set OPENAI_API_KEY   # pipe from stdin
+  sv ls                                   # shows: OPENAI_API_KEY
   sv exec -- npm run dev                  # runs with secrets injected
   sv exec -- node test.js                 # same
-  eval "$(sv env)"                        # export into current shell
 
 Agent usage:
   Agents should prefix commands with sv exec -- to get secrets without
@@ -259,9 +258,6 @@ Agent usage:
 
     sv exec -- npm test
     sv exec -- node scripts/call-api.js
-
-Shell integration:
-  eval "$(sv shell-hook)"                 # add to .zshrc once
 HELP
 }
 
@@ -277,14 +273,12 @@ case "$cmd" in
   get)        cmd_get "$@" ;;
   rm|remove)  cmd_rm "$@" ;;
   ls|list)    cmd_ls ;;
-  env)        cmd_env ;;
   exec)
     # Skip the -- separator if present
     [[ "${1:-}" == "--" ]] && shift
     [[ $# -eq 0 ]] && die "usage: sv exec -- <command> [args...]"
     cmd_exec "$@"
     ;;
-  shell-hook) cmd_shell_hook ;;
   help|--help|-h)
     cmd_help ;;
   *)

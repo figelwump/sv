@@ -6,26 +6,26 @@ Local dev secret management for macOS. Stores secrets in Keychain, injects them 
 
 ```bash
 # Symlink to somewhere on your PATH
-ln -sf "$(pwd)/tools/sv/sv" /usr/local/bin/sv
+ln -sf "$(pwd)/sv" /usr/local/bin/sv
 ```
 
 ## Quick start
 
 ```bash
-# Store secrets once
-sv set OPENAI_API_KEY sk-proj-...
-sv set ANTHROPIC_API_KEY sk-ant-...
+# Store secrets (always prompts — never pass values as arguments)
+sv set OPENAI_API_KEY
+sv set ANTHROPIC_API_KEY
+
+# Or pipe from another source
+echo "sk-proj-..." | sv set OPENAI_API_KEY
+
+# List stored secrets (names only, never values)
+sv ls
 
 # Run any command with secrets injected
 sv exec -- npm run dev
 sv exec -- node test.js
 sv exec -- pytest
-
-# List stored secrets (names only, never values)
-sv ls
-
-# Shell integration — add to .zshrc for auto-loading
-eval "$(sv shell-hook)"
 ```
 
 ## How it works
@@ -44,7 +44,7 @@ OPENAI_API_KEY
 DATABASE_URL
 ```
 
-When `sv exec` or `sv env` runs in a directory with `.secrets`, only those secrets are injected. Without a manifest, all stored secrets are injected.
+When `sv exec` runs in a directory with `.secrets` (searched up from cwd), only those secrets are injected — and it **fails if any are missing** from the keychain. Without a manifest, all stored secrets are injected.
 
 ## Agent usage
 
@@ -68,11 +68,9 @@ Never ask for or hardcode secret values. The `sv` tool injects them automaticall
 
 | Command | Description |
 |---|---|
-| `sv set <KEY> [value]` | Store a secret (prompts if no value) |
+| `sv set <KEY>` | Store a secret (prompts or reads stdin) |
 | `sv get <KEY>` | Print a secret value |
 | `sv rm <KEY>` | Delete a secret |
 | `sv ls` | List secret names |
 | `sv exec -- <cmd>` | Run command with secrets injected |
-| `sv env` | Print export statements for `eval` |
-| `sv shell-hook` | Print shell integration code |
 | `sv help` | Show help |
