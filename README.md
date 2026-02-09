@@ -64,12 +64,18 @@ Use `sv exec -- <command>` to run commands that need API keys or secrets.
 Never ask for or hardcode secret values. The `sv` tool injects them automatically.
 ```
 
+## Security
+
+`sv get` is gated behind a TTY check — it refuses to print secret values when stdout is piped or captured. This prevents agents (which capture command output) from reading secrets through `sv get`.
+
+This is a practical barrier, not a hard sandbox. An agent with shell access could still extract secrets through other means. The real enforcement is agent instructions — see the AGENTS.md snippet above.
+
 ## Commands
 
 | Command | Description |
 |---|---|
 | `sv set <KEY>` | Store a secret (prompts or reads stdin) |
-| `sv get <KEY>` | Print a secret value |
+| `sv get <KEY>` | Print a secret value (TTY only) |
 | `sv rm <KEY>` | Delete a secret |
 | `sv ls` | List secret names |
 | `sv exec -- <cmd>` | Run command with secrets injected |

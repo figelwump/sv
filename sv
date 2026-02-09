@@ -7,7 +7,7 @@
 #
 # Usage:
 #   sv set <KEY>               Store a secret (prompts or reads stdin)
-#   sv get <KEY>               Print a secret value
+#   sv get <KEY>               Print a secret value (interactive TTY only)
 #   sv rm <KEY>                Delete a secret
 #   sv ls                      List secret names (never values)
 #   sv exec -- <cmd> [args]    Run a command with secrets as env vars
@@ -176,6 +176,13 @@ cmd_get() {
   local key="${1:-}"
   [[ -z "$key" ]] && die "usage: sv get <KEY>"
 
+  # Guard: stdout must be a real terminal.
+  # When an agent captures output (pipes, $(), redirection) stdout is NOT a TTY.
+  # This blocks agents from reading secret values through sv get.
+  if [[ ! -t 1 ]]; then
+    die "sv get requires an interactive terminal (stdout must be a TTY)"
+  fi
+
   local value
   value="$(kc_get "$key")" || die "secret not found: $key"
   printf "%s\n" "$value"
@@ -227,7 +234,7 @@ sv — simple secret vault for local dev
 
 Usage:
   sv set <KEY>               Store a secret (prompts or reads stdin)
-  sv get <KEY>               Print a secret value
+  sv get <KEY>               Print a secret value (TTY only — blocked when piped)
   sv rm <KEY>                Delete a secret
   sv ls                      List secret names (never values)
   sv exec -- <cmd> [args]    Run a command with secrets as env vars
