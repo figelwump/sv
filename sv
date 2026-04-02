@@ -11,6 +11,7 @@
 #   sv rm <KEY>                Delete a secret
 #   sv ls                      List secret names (never values)
 #   sv exec -- <cmd> [args]    Run a command with secrets as env vars
+#   sv doctor                  Check backend setup and common failures
 #   sv update                  Update sv to the latest version
 #   sv version                 Print version
 #   sv help                    Show this help
@@ -35,6 +36,14 @@ die() {
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+linux_install_hint() {
+  if command -v apt-get >/dev/null 2>&1; then
+    printf "Install with: sudo apt install -y pass gnupg pinentry-curses"
+  else
+    printf "Install pass, gnupg, and a pinentry program for your Linux distro."
+  fi
 }
 
 detect_backend() {
@@ -252,6 +261,165 @@ store_ls() {
   esac
 }
 
+# ─── Doctor ───────────────────────────────────────────────────────────────────
+
+DOCTOR_FAILURES=0
+DOCTOR_WARNINGS=0
+
+doctor_info() {
+  printf "[info] %s\n" "$1"
+}
+
+doctor_ok() {
+  printf "[ok] %s\n" "$1"
+}
+
+doctor_warn() {
+  DOCTOR_WARNINGS=$((DOCTOR_WARNINGS + 1))
+  printf "[warn] %s\n" "$1"
+}
+
+doctor_fail() {
+  DOCTOR_FAILURES=$((DOCTOR_FAILURES + 1))
+  printf "[fail] %s\n" "$1"
+}
+
+doctor_check_cmd() {
+  local cmd="$1" label="$2" hint="${3:-}"
+  local path
+  path="$(command -v "$cmd" 2>/dev/null || true)"
+
+  if [[ -n "${path}" ]]; then
+    doctor_ok "${label}: ${path}"
+    return 0
+  fi
+
+  if [[ -n "${hint}" ]]; then
+    doctor_fail "${label}: missing. ${hint}"
+  else
+    doctor_fail "${label}: missing."
+  fi
+  return 1
+}
+
+doctor_check_keychain() {
+  local err_file err
+
+  doctor_info "backend: keychain"
+
+  if doctor_check_cmd security "security command"; then
+    if security dump-keychain >/dev/null 2>&1; then
+      doctor_ok "macOS Keychain listing is accessible"
+    else
+      doctor_fail "macOS Keychain listing is not accessible in this session"
+    fi
+
+    err_file="$(mktemp)"
+    if security find-generic-password \
+      -a "${SV_KEYCHAIN_ACCOUNT}" \
+      -s "${SV_SERVICE_PREFIX}__sv_doctor_probe__" \
+      -w >/dev/null 2>"${err_file}"; then
+      doctor_ok "macOS Keychain lookup is accessible"
+    else
+      err="$(<"${err_file}")"
+      if [[ "${err}" == *"could not be found"* ]]; then
+        doctor_ok "macOS Keychain lookup is accessible"
+      else
+        err="${err//$'\n'/ }"
+        doctor_fail "macOS Keychain lookup failed: ${err}"
+      fi
+    fi
+    rm -f "${err_file}"
+  fi
+}
+
+doctor_check_pass() {
+  local pass_ok=0 gpg_ok=0
+  local store_dir gpg_home agent_socket pinentry_cmd=""
+
+  store_dir="$(pass_store_dir)"
+  gpg_home="${GNUPGHOME:-${HOME}/.gnupg}"
+
+  doctor_info "backend: pass"
+  doctor_info "password store dir: ${store_dir}"
+  doctor_info "gpg home: ${gpg_home}"
+
+  if doctor_check_cmd pass "pass command" "$(linux_install_hint)"; then
+    pass_ok=1
+  fi
+
+  if doctor_check_cmd gpg "gpg command" "$(linux_install_hint)"; then
+    gpg_ok=1
+  fi
+
+  if [[ ${pass_ok} -eq 1 ]]; then
+    if pass_store_initialized; then
+      doctor_ok "password store initialized: ${store_dir}/.gpg-id"
+    else
+      doctor_fail "password store not initialized. Run: pass init <gpg-id>"
+    fi
+  fi
+
+  if [[ ${gpg_ok} -eq 1 ]]; then
+    if gpg --batch --with-colons --list-secret-keys 2>/dev/null | grep -q '^sec:'; then
+      doctor_ok "at least one secret GPG key is available"
+    else
+      doctor_fail "no secret GPG key found. Generate or import a key, then run: pass init <gpg-id>"
+    fi
+  fi
+
+  if command -v gpgconf >/dev/null 2>&1; then
+    agent_socket="$(gpgconf --list-dirs agent-socket 2>/dev/null || true)"
+    if [[ -n "${agent_socket}" && -S "${agent_socket}" ]]; then
+      doctor_ok "gpg-agent socket present: ${agent_socket}"
+    else
+      doctor_warn "gpg-agent socket not detected. Headless sessions may need an unlocked gpg-agent."
+    fi
+  else
+    doctor_warn "gpgconf not found; cannot inspect gpg-agent state"
+  fi
+
+  for candidate in pinentry pinentry-curses pinentry-tty pinentry-gtk-2 pinentry-gnome3; do
+    if command -v "${candidate}" >/dev/null 2>&1; then
+      pinentry_cmd="$(command -v "${candidate}")"
+      break
+    fi
+  done
+
+  if [[ -n "${pinentry_cmd}" ]]; then
+    doctor_ok "pinentry available: ${pinentry_cmd}"
+  else
+    doctor_warn "no pinentry program found in PATH. $(linux_install_hint)"
+  fi
+
+  if [[ -t 1 && -z "${GPG_TTY:-}" ]]; then
+    doctor_warn "GPG_TTY is not set. Some terminal sessions need: export GPG_TTY=\$(tty)"
+  fi
+}
+
+cmd_doctor() {
+  DOCTOR_FAILURES=0
+  DOCTOR_WARNINGS=0
+
+  doctor_info "sv version: ${SV_VERSION}"
+
+  case "${SV_BACKEND}" in
+    keychain) doctor_check_keychain ;;
+    pass)     doctor_check_pass ;;
+  esac
+
+  if [[ ${DOCTOR_FAILURES} -gt 0 ]]; then
+    printf "sv doctor: %d failure(s), %d warning(s)\n" "${DOCTOR_FAILURES}" "${DOCTOR_WARNINGS}"
+    return 1
+  fi
+
+  if [[ ${DOCTOR_WARNINGS} -gt 0 ]]; then
+    printf "sv doctor: ok with %d warning(s)\n" "${DOCTOR_WARNINGS}"
+  else
+    printf "sv doctor: ok\n"
+  fi
+}
+
 # ─── Manifest ─────────────────────────────────────────────────────────────────
 
 # Walk up from the current directory to find a .secrets manifest.
@@ -456,6 +624,7 @@ Usage:
   sv rm <KEY>                Delete a secret
   sv ls                      List secret names (never values)
   sv exec -- <cmd> [args]    Run a command with secrets as env vars
+  sv doctor                  Check backend setup and common failures
   sv update                  Update sv to the latest version
   sv version                 Print version
   sv help                    Show this help
@@ -502,6 +671,7 @@ case "$cmd" in
   get)        cmd_get "$@" ;;
   rm|remove)  cmd_rm "$@" ;;
   ls|list)    cmd_ls ;;
+  doctor)     cmd_doctor ;;
   exec)
     # Skip the -- separator if present
     [[ "${1:-}" == "--" ]] && shift

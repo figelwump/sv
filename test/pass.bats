@@ -99,3 +99,32 @@ teardown() {
 
   rm -rf "$empty_store" "$manifest_dir"
 }
+
+@test "sv doctor reports pass backend health" {
+  run bash -c "export PASSWORD_STORE_DIR='$PASSWORD_STORE_DIR' GNUPGHOME='$GNUPGHOME'; '$SV_BIN' doctor"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"backend: pass"* ]]
+  [[ "$output" == *"password store initialized"* ]]
+}
+
+@test "sv doctor fails clearly when password-store is uninitialized" {
+  local empty_store
+  empty_store="$(mktemp -d)"
+
+  run bash -c "export PASSWORD_STORE_DIR='$empty_store' GNUPGHOME='$GNUPGHOME'; '$SV_BIN' doctor"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"password store not initialized"* ]]
+
+  rm -rf "$empty_store"
+}
+
+@test "sv doctor warnings still exit successfully" {
+  GNUPGHOME="$GNUPGHOME" gpgconf --kill gpg-agent >/dev/null 2>&1 || true
+
+  run bash -c "export PASSWORD_STORE_DIR='$PASSWORD_STORE_DIR' GNUPGHOME='$GNUPGHOME'; '$SV_BIN' doctor"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"[warn]"* ]]
+  [[ "$output" == *"sv doctor: ok with"* ]]
+
+  GNUPGHOME="$GNUPGHOME" gpgconf --launch gpg-agent >/dev/null 2>&1 || true
+}

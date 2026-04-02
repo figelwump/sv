@@ -11,6 +11,33 @@ teardown_file() {
   test_backend_teardown_file
 }
 
+setup() {
+  case "$(test_backend)" in
+    keychain)
+      test_require_keychain
+      ;;
+    pass)
+      test_require_pass
+      test_source_pass_env
+      ;;
+    *)
+      skip "unsupported OS for sv tests"
+      ;;
+  esac
+
+  test_store_purge
+}
+
+teardown() {
+  case "$(test_backend)" in
+    pass)
+      test_source_pass_env
+      ;;
+  esac
+
+  test_store_purge
+}
+
 # ─── Key validation ──────────────────────────────────────────────────────────
 
 @test "rejects key with hyphens" {
@@ -98,6 +125,12 @@ teardown_file() {
   run "$SV_BIN" exec
   [ "$status" -ne 0 ]
   [[ "$output" == *"usage"* ]]
+}
+
+@test "sv doctor reports the detected backend" {
+  run "$SV_BIN" doctor
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"backend: $(test_backend)"* ]]
 }
 
 # ─── Unknown command ─────────────────────────────────────────────────────────

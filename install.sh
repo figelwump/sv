@@ -22,6 +22,14 @@ note() {
   printf "sv-install: %s\n" "$*" >&2
 }
 
+linux_install_hint() {
+  if command -v apt-get >/dev/null 2>&1; then
+    printf "Install with: sudo apt install -y pass gnupg pinentry-curses"
+  else
+    printf "Install pass, gnupg, and a pinentry program for your Linux distro."
+  fi
+}
+
 OS="$(uname -s)"
 
 case "${OS}" in
@@ -29,8 +37,8 @@ case "${OS}" in
     command -v security >/dev/null 2>&1 || die "macOS security command not found"
     ;;
   Linux)
-    command -v pass >/dev/null 2>&1 || die "pass is required on Linux"
-    command -v gpg >/dev/null 2>&1 || die "gpg is required on Linux"
+    command -v pass >/dev/null 2>&1 || die "pass is required on Linux. $(linux_install_hint)"
+    command -v gpg >/dev/null 2>&1 || die "gpg is required on Linux. $(linux_install_hint)"
     ;;
   *)
     die "sv only supports macOS and Linux"
