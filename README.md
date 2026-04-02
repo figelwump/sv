@@ -1,14 +1,17 @@
 # sv — simple secret vault
 
-Local dev secret management for macOS. Stores secrets in the Keychain, injects them into processes on demand.
+Local dev secret management for macOS and Linux. Stores secrets in the macOS Keychain or Linux password-store, then injects them into processes on demand.
 
-No files, no databases, no daemon. One script, one command prefix: `sv exec --`.
+No plaintext secret files, no database, no daemon. One script, one command prefix: `sv exec --`.
 
 ## Install
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/figelwump/sv/main/install.sh | bash
 ```
+
+- macOS requires the native `security` CLI.
+- Linux requires `pass` and `gpg`.
 
 Or clone and copy manually:
 
@@ -44,9 +47,25 @@ sv exec -- pytest
 
 ## How it works
 
-Secrets are stored in the macOS Keychain under the service prefix `sv:`. The native `security` CLI does the heavy lifting — your secrets are encrypted at rest and survive reboots.
+On macOS, secrets are stored in the Keychain under the service prefix `sv:`. The native `security` CLI does the heavy lifting.
+
+On Linux, secrets are stored in `pass` under the `sv/` namespace inside your password store. `sv` expects `pass init <gpg-id>` to have already been run.
 
 `sv exec -- <cmd>` resolves secrets and injects them as environment variables into the subprocess. The calling process (or agent) never sees the values.
+
+## Linux / Raspberry Pi setup
+
+Install the required tools, create or import a GPG key, then initialize `pass`:
+
+```bash
+pass init <gpg-id>
+```
+
+Notes:
+
+- `sv` uses `~/.password-store` by default, or `PASSWORD_STORE_DIR` if you already set it.
+- On headless Linux or Raspberry Pi, `sv set`, `sv get`, and `sv exec` may require an already-unlocked `gpg-agent`.
+- If `sv` says the Linux password store is not initialized, initialize it with `pass init <gpg-id>` first.
 
 ## Project manifests
 
@@ -58,7 +77,7 @@ OPENAI_API_KEY
 DATABASE_URL
 ```
 
-- When present, `sv exec` only injects listed secrets and **fails if any are missing** from the keychain.
+- When present, `sv exec` only injects listed secrets and **fails if any are missing** from the active backend.
 - When absent, all stored secrets are injected.
 - The manifest is found by searching up from the current directory, so running from a subdirectory works.
 
@@ -78,8 +97,8 @@ Add to your project's `AGENTS.md`:
 
 Use `sv exec -- <command>` to run commands that need API keys or secrets.
 Never ask for or hardcode secret values. The `sv` tool injects them automatically.
-Do NOT use `sv get`, `printenv`, `env`, or `security find-generic-password` to
-read secret values. These commands exist for human use only.
+Do NOT use `sv get`, `printenv`, `env`, `security find-generic-password`, or
+`pass show` to read secret values. These commands exist for human use only.
 ```
 
 ## Security
@@ -92,13 +111,17 @@ These are practical barriers, not a hard sandbox. An agent with shell access cou
 
 ## Testing
 
-Tests use [bats-core](https://github.com/bats-core/bats-core) and run against the real macOS Keychain in an isolated `sv_test:` namespace — no mocks, no fakes.
+Tests use [bats-core](https://github.com/bats-core/bats-core) and run against the real backend — no mocks, no fakes.
+
+- macOS tests use an isolated `sv_test:` Keychain namespace.
+- Linux tests use a temporary password store and temporary GPG home.
 
 ```bash
-brew install bats-core   # one-time
+bats --version           # verify bats is installed
 make test                # run all tests
-make test-keychain       # run a single test file
-make test-purge          # remove any orphaned test secrets
+make test-keychain       # macOS only
+make test-pass           # Linux only
+make test-purge          # purge macOS test secrets
 ```
 
 ## Commands

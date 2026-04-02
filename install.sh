@@ -18,13 +18,25 @@ die() {
   exit 1
 }
 
-# Check macOS
-[[ "$(uname -s)" == "Darwin" ]] || die "sv only supports macOS"
+note() {
+  printf "sv-install: %s\n" "$*" >&2
+}
 
-# Check for security CLI
-command -v security >/dev/null 2>&1 || die "macOS security command not found"
+OS="$(uname -s)"
 
-# Check curl
+case "${OS}" in
+  Darwin)
+    command -v security >/dev/null 2>&1 || die "macOS security command not found"
+    ;;
+  Linux)
+    command -v pass >/dev/null 2>&1 || die "pass is required on Linux"
+    command -v gpg >/dev/null 2>&1 || die "gpg is required on Linux"
+    ;;
+  *)
+    die "sv only supports macOS and Linux"
+    ;;
+esac
+
 command -v curl >/dev/null 2>&1 || die "curl is required"
 
 # Download
@@ -54,3 +66,8 @@ trap - EXIT
 
 printf "sv installed to %s\n" "${INSTALL_PATH}"
 printf "Run 'sv help' to get started.\n"
+
+if [[ "${OS}" == "Linux" && ! -f "${PASSWORD_STORE_DIR:-$HOME/.password-store}/.gpg-id" ]]; then
+  note "password-store is not initialized yet."
+  note "Run 'pass init <gpg-id>' before using sv."
+fi

@@ -3,19 +3,40 @@
 
 load test_helper
 
+setup_file() {
+  test_backend_setup_file
+}
+
+teardown_file() {
+  test_backend_teardown_file
+}
+
 setup() {
-  test_kc_purge
+  case "$(test_backend)" in
+    keychain)
+      test_require_keychain
+      ;;
+    pass)
+      test_require_pass
+      test_source_pass_env
+      ;;
+    *)
+      skip "unsupported OS for sv tests"
+      ;;
+  esac
+
+  test_store_purge
   TEST_TMPDIR="$(mktemp -d)"
 }
 
 teardown() {
-  test_kc_purge
+  test_store_purge
   rm -rf "$TEST_TMPDIR"
 }
 
 @test "manifest scopes injection to only listed secrets" {
-  test_kc_set LISTED_KEY "listed_val"
-  test_kc_set UNLISTED_KEY "unlisted_val"
+  test_store_set LISTED_KEY "listed_val"
+  test_store_set UNLISTED_KEY "unlisted_val"
   echo "LISTED_KEY" > "$TEST_TMPDIR/.secrets"
   # LISTED_KEY should be injected
   run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec -- printenv LISTED_KEY"
@@ -27,7 +48,7 @@ teardown() {
 }
 
 @test "manifest is found in parent directory" {
-  test_kc_set PARENT_KEY "parent_val"
+  test_store_set PARENT_KEY "parent_val"
   echo "PARENT_KEY" > "$TEST_TMPDIR/.secrets"
   mkdir -p "$TEST_TMPDIR/subdir/deep"
   run bash -c "cd '$TEST_TMPDIR/subdir/deep' && '$SV_BIN' exec -- printenv PARENT_KEY"
@@ -45,7 +66,7 @@ teardown() {
 }
 
 @test "empty manifest injects nothing, just runs command" {
-  test_kc_set SOME_KEY "some_val"
+  test_store_set SOME_KEY "some_val"
   # Manifest exists but is empty
   touch "$TEST_TMPDIR/.secrets"
   run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec -- echo ran_ok"
@@ -54,7 +75,7 @@ teardown() {
 }
 
 @test "comments-only manifest injects nothing" {
-  test_kc_set SOME_KEY "some_val"
+  test_store_set SOME_KEY "some_val"
   cat > "$TEST_TMPDIR/.secrets" <<'EOF'
 # This is a comment
 # Another comment
@@ -66,7 +87,7 @@ EOF
 }
 
 @test "manifest trims whitespace around key names" {
-  test_kc_set TRIMMED_KEY "trimmed_val"
+  test_store_set TRIMMED_KEY "trimmed_val"
   # Key with leading/trailing whitespace
   printf "  TRIMMED_KEY  \n" > "$TEST_TMPDIR/.secrets"
   run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec -- printenv TRIMMED_KEY"
@@ -75,8 +96,8 @@ EOF
 }
 
 @test "no manifest injects all secrets" {
-  test_kc_set ALL_KEY_A "val_a"
-  test_kc_set ALL_KEY_B "val_b"
+  test_store_set ALL_KEY_A "val_a"
+  test_store_set ALL_KEY_B "val_b"
   # No .secrets file — should inject everything
   mkdir -p "$TEST_TMPDIR/no_manifest"
   run bash -c "cd '$TEST_TMPDIR/no_manifest' && '$SV_BIN' exec -- bash -c 'echo \$ALL_KEY_A \$ALL_KEY_B'"
@@ -85,7 +106,7 @@ EOF
 }
 
 @test "manifest with mixed content: comments, blanks, and valid keys" {
-  test_kc_set REAL_KEY "real_val"
+  test_store_set REAL_KEY "real_val"
   cat > "$TEST_TMPDIR/.secrets" <<'EOF'
 # comment at top
 

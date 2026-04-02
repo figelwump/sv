@@ -2,8 +2,8 @@
 #
 # sv — simple secret vault for local dev
 #
-# Stores secrets in macOS Keychain. Injects them into processes on demand.
-# Never stores values in files. Never prints values unless explicitly asked.
+# Stores secrets in macOS Keychain on macOS and password-store on Linux.
+# Never stores values in plaintext files. Never prints values unless explicitly asked.
 #
 # Usage:
 #   sv set <KEY>               Store a secret (prompts or reads stdin)
@@ -24,6 +24,7 @@ readonly SV_RAW_URL="https://raw.githubusercontent.com/${SV_REPO}/main/sv"
 readonly SV_SERVICE_PREFIX="${SV_SERVICE_PREFIX:-sv:}"
 readonly SV_KEYCHAIN_ACCOUNT="${USER}"
 readonly SV_MANIFEST=".secrets"
+readonly SV_PASS_NAMESPACE="sv"
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -35,6 +36,16 @@ die() {
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
+
+detect_backend() {
+  case "$(uname -s)" in
+    Darwin) printf "keychain\n" ;;
+    Linux) printf "pass\n" ;;
+    *) die "unsupported OS: $(uname -s)" ;;
+  esac
+}
+
+readonly SV_BACKEND="$(detect_backend)"
 
 # ─── Keychain operations ──────────────────────────────────────────────────────
 
@@ -77,6 +88,170 @@ kc_ls() {
     || true
 }
 
+# ─── Linux password-store operations ──────────────────────────────────────────
+
+pass_store_dir() {
+  printf "%s\n" "${PASSWORD_STORE_DIR:-${HOME}/.password-store}"
+}
+
+pass_entry_path() {
+  local key="$1"
+  printf "%s/%s\n" "${SV_PASS_NAMESPACE}" "${key}"
+}
+
+pass_entry_file() {
+  local key="$1"
+  printf "%s/%s.gpg\n" "$(pass_store_dir)" "$(pass_entry_path "$key")"
+}
+
+pass_store_initialized() {
+  [[ -f "$(pass_store_dir)/.gpg-id" ]]
+}
+
+pass_require_ready() {
+  need_cmd pass
+  need_cmd gpg
+
+  if ! pass_store_initialized; then
+    die "Linux password store is not initialized. Run 'pass init <gpg-id>' before using sv."
+  fi
+}
+
+pass_handle_failure() {
+  local action="$1" err="$2"
+
+  case "$err" in
+    *"No pinentry"*|*"Inappropriate ioctl for device"*|*"No secret key"*|*"decryption failed"*)
+      die "failed to ${action} in the Linux password store. Ensure your GPG key is available and gpg-agent can prompt or is already unlocked."
+      ;;
+  esac
+
+  if [[ -n "${err}" ]]; then
+    err="${err//$'\n'/ }"
+    die "failed to ${action} in the Linux password store: ${err}"
+  fi
+
+  die "failed to ${action} in the Linux password store."
+}
+
+pass_has() {
+  [[ -f "$(pass_entry_file "$1")" ]]
+}
+
+pass_set() {
+  local key="$1" value="$2"
+
+  local err_file
+  err_file="$(mktemp)"
+
+  if printf "%s\n" "$value" | pass insert --multiline --force "$(pass_entry_path "$key")" >/dev/null 2>"${err_file}"; then
+    rm -f "${err_file}"
+    return 0
+  fi
+
+  local err
+  err="$(<"${err_file}")"
+  rm -f "${err_file}"
+  pass_handle_failure "store a secret" "${err}"
+}
+
+pass_get() {
+  local key="$1"
+
+  if ! pass_has "$key"; then
+    return 1
+  fi
+
+  local err_file
+  err_file="$(mktemp)"
+  if pass show "$(pass_entry_path "$key")" 2>"${err_file}"; then
+    rm -f "${err_file}"
+    return 0
+  fi
+
+  local err
+  err="$(<"${err_file}")"
+  rm -f "${err_file}"
+  pass_handle_failure "read a secret" "${err}"
+}
+
+pass_rm() {
+  local key="$1"
+
+  pass rm --force "$(pass_entry_path "$key")" >/dev/null 2>&1
+}
+
+pass_ls() {
+  local root
+  root="$(pass_store_dir)/${SV_PASS_NAMESPACE}"
+
+  [[ -d "${root}" ]] || return 0
+
+  find "${root}" -type f -name '*.gpg' -print \
+    | sed "s#^${root}/##" \
+    | sed 's/\.gpg$//' \
+    | sort -u
+}
+
+# ─── Backend dispatch ─────────────────────────────────────────────────────────
+
+store_require_ready() {
+  case "${SV_BACKEND}" in
+    keychain)
+      need_cmd security
+      ;;
+    pass)
+      pass_require_ready
+      ;;
+  esac
+}
+
+store_has() {
+  case "${SV_BACKEND}" in
+    keychain) kc_get "$1" >/dev/null 2>&1 ;;
+    pass)     pass_has "$1" ;;
+  esac
+}
+
+store_set() {
+  store_require_ready
+
+  case "${SV_BACKEND}" in
+    keychain) kc_set "$@" ;;
+    pass)     pass_set "$@" ;;
+  esac
+}
+
+store_get() {
+  store_require_ready
+
+  case "${SV_BACKEND}" in
+    keychain) kc_get "$1" ;;
+    pass)     pass_get "$1" ;;
+  esac
+}
+
+store_rm() {
+  store_require_ready
+
+  case "${SV_BACKEND}" in
+    keychain) kc_rm "$1" ;;
+    pass)     pass_rm "$1" ;;
+  esac
+}
+
+store_ls() {
+  case "${SV_BACKEND}" in
+    keychain)
+      need_cmd security
+      kc_ls
+      ;;
+    pass)
+      pass_ls
+      ;;
+  esac
+}
+
 # ─── Manifest ─────────────────────────────────────────────────────────────────
 
 # Walk up from the current directory to find a .secrets manifest.
@@ -113,7 +288,7 @@ read_manifest() {
 
 # If a .secrets manifest is found (searching up from cwd), use it to scope.
 # Otherwise, inject all sv secrets.
-# Fails if a manifest lists a key not found in the keychain.
+# Fails if a manifest lists a key not found in the active backend.
 resolve_secret_names() {
   local manifest_path
   manifest_path="$(find_manifest)"
@@ -125,10 +300,12 @@ resolve_secret_names() {
       return
     fi
 
-    # Validate every manifest key exists in the keychain
+    store_require_ready
+
+    # Validate every manifest key exists in the active backend
     local missing=()
     while IFS= read -r key; do
-      if ! kc_get "$key" >/dev/null 2>&1; then
+      if ! store_has "$key"; then
         missing+=("$key")
       fi
     done <<< "$manifest_keys"
@@ -139,7 +316,7 @@ resolve_secret_names() {
 
     printf "%s\n" "${manifest_keys}"
   else
-    kc_ls
+    store_ls
   fi
 }
 
@@ -173,7 +350,7 @@ cmd_set() {
 
   [[ -z "$value" ]] && die "no value provided"
 
-  kc_set "$key" "$value"
+  store_set "$key" "$value"
   printf "sv: stored %s\n" "$key" >&2
 }
 
@@ -189,7 +366,7 @@ cmd_get() {
   fi
 
   local value
-  value="$(kc_get "$key")" || die "secret not found: $key"
+  value="$(store_get "$key")" || die "secret not found: $key"
   printf "%s\n" "$value"
 }
 
@@ -197,13 +374,13 @@ cmd_rm() {
   local key="${1:-}"
   [[ -z "$key" ]] && die "usage: sv rm <KEY>"
 
-  kc_rm "$key" || die "secret not found: $key"
+  store_rm "$key" || die "secret not found: $key"
   printf "sv: removed %s\n" "$key" >&2
 }
 
 cmd_ls() {
   local keys
-  keys="$(kc_ls)"
+  keys="$(store_ls)"
   if [[ -z "$keys" ]]; then
     printf "sv: no secrets stored\n" >&2
     return
@@ -225,7 +402,7 @@ cmd_exec() {
   local env_args=()
   while IFS= read -r key; do
     local value
-    value="$(kc_get "$key" 2>/dev/null)" || continue
+    value="$(store_get "$key")" || die "failed to resolve secret: $key"
     env_args+=("${key}=${value}")
   done <<< "$names"
 
@@ -291,7 +468,7 @@ Project manifests:
     DATABASE_URL
 
   When present, sv exec only injects listed secrets and fails if any
-  are missing from the keychain. When absent, all stored secrets are injected.
+  are missing from the active backend. When absent, all stored secrets are injected.
 
   The manifest is found by searching up from the current directory.
 
@@ -308,12 +485,14 @@ Agent usage:
 
     sv exec -- npm test
     sv exec -- node scripts/call-api.js
+
+Backends:
+  macOS uses the Keychain via `security`.
+  Linux uses password-store via `pass`.
 HELP
 }
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
-
-need_cmd security
 
 cmd="${1:-help}"
 shift || true

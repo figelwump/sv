@@ -3,19 +3,39 @@
 
 load test_helper
 
+setup_file() {
+  test_backend_setup_file
+}
+
+teardown_file() {
+  test_backend_teardown_file
+}
+
 # Override setup to also create a temp dir for manifests
 setup() {
-  test_kc_purge
+  case "$(test_backend)" in
+    keychain)
+      test_require_keychain
+      ;;
+    pass)
+      test_require_pass
+      test_source_pass_env
+      ;;
+    *)
+      skip "unsupported OS for sv tests"
+      ;;
+  esac
+  test_store_purge
   TEST_TMPDIR="$(mktemp -d)"
 }
 
 teardown() {
-  test_kc_purge
+  test_store_purge
   rm -rf "$TEST_TMPDIR"
 }
 
 @test "sv exec injects secret as env var" {
-  test_kc_set API_KEY "secret_api_123"
+  test_store_set API_KEY "secret_api_123"
   # Create a manifest so only our key is injected
   echo "API_KEY" > "$TEST_TMPDIR/.secrets"
   run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec -- printenv API_KEY"
@@ -24,7 +44,7 @@ teardown() {
 }
 
 @test "sv exec passes arguments through to child" {
-  test_kc_set DUMMY "val"
+  test_store_set DUMMY "val"
   echo "DUMMY" > "$TEST_TMPDIR/.secrets"
   run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec -- echo hello world"
   [ "$status" -eq 0 ]
@@ -32,7 +52,7 @@ teardown() {
 }
 
 @test "sv exec works without -- separator" {
-  test_kc_set DUMMY "val"
+  test_store_set DUMMY "val"
   echo "DUMMY" > "$TEST_TMPDIR/.secrets"
   run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec echo hello"
   [ "$status" -eq 0 ]
@@ -54,9 +74,9 @@ teardown() {
 }
 
 @test "sv exec injects multiple secrets simultaneously" {
-  test_kc_set KEY_A "val_a"
-  test_kc_set KEY_B "val_b"
-  test_kc_set KEY_C "val_c"
+  test_store_set KEY_A "val_a"
+  test_store_set KEY_B "val_b"
+  test_store_set KEY_C "val_c"
   printf "KEY_A\nKEY_B\nKEY_C\n" > "$TEST_TMPDIR/.secrets"
   run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec -- bash -c 'echo \$KEY_A \$KEY_B \$KEY_C'"
   [ "$status" -eq 0 ]
@@ -71,7 +91,7 @@ teardown() {
 
 @test "sv exec secret values are not visible as sv arguments in process list" {
   # This verifies that exec env is used (values in env, not in argv)
-  test_kc_set SECRET_PS "hidden_value"
+  test_store_set SECRET_PS "hidden_value"
   echo "SECRET_PS" > "$TEST_TMPDIR/.secrets"
   # The child should see the env var, but it should not be in $0 or args
   run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec -- printenv SECRET_PS"

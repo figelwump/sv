@@ -3,6 +3,14 @@
 
 load test_helper
 
+setup_file() {
+  test_backend_setup_file
+}
+
+teardown_file() {
+  test_backend_teardown_file
+}
+
 # ─── Key validation ──────────────────────────────────────────────────────────
 
 @test "rejects key with hyphens" {
@@ -20,21 +28,21 @@ load test_helper
 @test "accepts key starting with underscore" {
   run bash -c "echo val | '$SV_BIN' set _PRIVATE"
   [ "$status" -eq 0 ]
-  result="$(test_kc_get _PRIVATE)"
+  result="$(test_store_get _PRIVATE)"
   [ "$result" = "val" ]
 }
 
 @test "accepts uppercase key with underscores and digits" {
   run bash -c "echo val | '$SV_BIN' set UPPER_CASE_123"
   [ "$status" -eq 0 ]
-  result="$(test_kc_get UPPER_CASE_123)"
+  result="$(test_store_get UPPER_CASE_123)"
   [ "$result" = "val" ]
 }
 
 @test "accepts lowercase key" {
   run bash -c "echo val | '$SV_BIN' set lower_case"
   [ "$status" -eq 0 ]
-  result="$(test_kc_get lower_case)"
+  result="$(test_store_get lower_case)"
   [ "$result" = "val" ]
 }
 
@@ -144,15 +152,15 @@ load test_helper
 # ─── rm/remove and ls/list aliases ───────────────────────────────────────────
 
 @test "sv remove is alias for sv rm" {
-  test_kc_set ALIAS_KEY "alias_val"
+  test_store_set ALIAS_KEY "alias_val"
   run "$SV_BIN" remove ALIAS_KEY
   [ "$status" -eq 0 ]
-  run test_kc_get ALIAS_KEY
+  run test_store_get ALIAS_KEY
   [ "$status" -ne 0 ]
 }
 
 @test "sv list is alias for sv ls" {
-  test_kc_set LIST_KEY "list_val"
+  test_store_set LIST_KEY "list_val"
   run "$SV_BIN" list
   [ "$status" -eq 0 ]
   [[ "$output" == *"LIST_KEY"* ]]

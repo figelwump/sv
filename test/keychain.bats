@@ -3,6 +3,15 @@
 
 load test_helper
 
+setup() {
+  test_require_keychain
+  test_kc_purge
+}
+
+teardown() {
+  test_kc_purge
+}
+
 @test "sv set stores a secret via stdin pipe" {
   run bash -c "echo 'test_value_123' | '$SV_BIN' set MY_KEY"
   [ "$status" -eq 0 ]
