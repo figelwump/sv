@@ -24,9 +24,9 @@ note() {
 
 linux_install_hint() {
   if command -v apt-get >/dev/null 2>&1; then
-    printf "Install with: sudo apt install -y pass gnupg pinentry-curses"
+    printf "Install with: sudo apt install -y pass gnupg pinentry-curses. After install, run: sv doctor"
   else
-    printf "Install pass, gnupg, and a pinentry program for your Linux distro."
+    printf "Install pass, gnupg, and a pinentry program for your Linux distro. After install, run: sv doctor"
   fi
 }
 
