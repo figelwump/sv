@@ -284,6 +284,10 @@ doctor_fail() {
   printf "[fail] %s\n" "$1"
 }
 
+doctor_next() {
+  printf "[next] %s\n" "$1"
+}
+
 doctor_check_cmd() {
   local cmd="$1" label="$2" hint="${3:-}"
   local path
@@ -336,6 +340,8 @@ doctor_check_keychain() {
 doctor_check_pass() {
   local pass_ok=0 gpg_ok=0
   local store_dir gpg_home agent_socket pinentry_cmd=""
+  local gpg_ids=()
+  local gpg_id=""
 
   store_dir="$(pass_store_dir)"
   gpg_home="${GNUPGHOME:-${HOME}/.gnupg}"
@@ -352,19 +358,31 @@ doctor_check_pass() {
     gpg_ok=1
   fi
 
+  if [[ ${gpg_ok} -eq 1 ]]; then
+    while IFS= read -r gpg_id; do
+      [[ -n "${gpg_id}" ]] && gpg_ids+=("${gpg_id}")
+    done < <(gpg --batch --with-colons --list-secret-keys 2>/dev/null | awk -F: '$1 == "sec" { print $5 }')
+  fi
+
   if [[ ${pass_ok} -eq 1 ]]; then
     if pass_store_initialized; then
       doctor_ok "password store initialized: ${store_dir}/.gpg-id"
     else
       doctor_fail "password store not initialized. Run: pass init <gpg-id>"
+      if [[ ${#gpg_ids[@]} -gt 0 ]]; then
+        doctor_next "Initialize pass with: pass init ${gpg_ids[0]}"
+      fi
     fi
   fi
 
   if [[ ${gpg_ok} -eq 1 ]]; then
-    if gpg --batch --with-colons --list-secret-keys 2>/dev/null | grep -q '^sec:'; then
+    if [[ ${#gpg_ids[@]} -gt 0 ]]; then
       doctor_ok "at least one secret GPG key is available"
     else
       doctor_fail "no secret GPG key found. Generate or import a key, then run: pass init <gpg-id>"
+      doctor_next "Create a key with: gpg --full-generate-key"
+      doctor_next "List keys with: gpg --list-secret-keys --keyid-format=long"
+      doctor_next "Initialize pass with: pass init <gpg-id>"
     fi
   fi
 
@@ -394,6 +412,7 @@ doctor_check_pass() {
 
   if [[ -t 1 && -z "${GPG_TTY:-}" ]]; then
     doctor_warn "GPG_TTY is not set. Some terminal sessions need: export GPG_TTY=\$(tty)"
+    doctor_next "Set it in this shell with: export GPG_TTY=\$(tty)"
   fi
 }
 
