@@ -11,7 +11,8 @@ curl -fsSL https://raw.githubusercontent.com/figelwump/sv/main/install.sh | bash
 ```
 
 - macOS requires the native `security` CLI.
-- Linux requires `pass` and `gpg`.
+- On Debian / Raspberry Pi OS, `install.sh` will try to install `pass`, `gpg`, and `pinentry-curses` automatically.
+- On other Linux distros, install `pass`, `gpg`, and a pinentry program first, then run `sv doctor` after install.
 
 Or clone and copy manually:
 
@@ -55,16 +56,28 @@ On Linux, secrets are stored in `pass` under the `sv/` namespace inside your pas
 
 ## Linux / Raspberry Pi setup
 
-Install the required tools, create or import a GPG key, then initialize `pass`:
+On Debian / Raspberry Pi OS, start with:
 
 ```bash
+./install.sh
+sv doctor
+```
+
+If `sv doctor` reports that no secret GPG key exists, create one and initialize `pass`:
+
+```bash
+gpg --full-generate-key
+gpg --list-secret-keys --keyid-format=long
 pass init <gpg-id>
+sv doctor
 ```
 
 Notes:
 
 - `sv` uses `~/.password-store` by default, or `PASSWORD_STORE_DIR` if you already set it.
+- `sv doctor` is the main troubleshooting command for Linux setup and session issues.
 - On headless Linux or Raspberry Pi, `sv set`, `sv get`, and `sv exec` may require an already-unlocked `gpg-agent`.
+- Linux agent usage is not fully fire-and-forget after a fresh boot. In practice, a human usually needs to unlock `gpg-agent` once in a real terminal session before agents can use `sv exec` non-interactively.
 - If `sv` says the Linux password store is not initialized, initialize it with `pass init <gpg-id>` first.
 
 ## Project manifests
@@ -90,6 +103,8 @@ sv exec -- npm test
 sv exec -- node scripts/call-api.js
 ```
 
+On Linux, this assumes `gpg-agent` is already unlocked in the current session. If it is not, `sv exec` may trigger a passphrase prompt or fail in non-interactive contexts.
+
 Add to your project's `AGENTS.md`:
 
 ```markdown
@@ -105,6 +120,7 @@ Do NOT use `sv get`, `printenv`, `env`, `security find-generic-password`, or
 
 - **`sv set`** never accepts the value as a CLI argument — it prompts interactively or reads stdin. This keeps secrets out of shell history.
 - **`sv get`** is gated behind a TTY check — it refuses to print values when stdout is piped or captured. This blocks agents (which capture command output) from reading secrets through `sv get`.
+- **Linux `sv exec`** depends on `gpg-agent` state. If the agent is locked, non-interactive processes cannot satisfy the passphrase prompt.
 - **`.secrets` manifests** declare requirements by name only and are safe to commit. They scope injection so projects only get the secrets they need.
 
 These are practical barriers, not a hard sandbox. An agent with shell access could still extract secrets through other means. The real enforcement is agent instructions.
@@ -133,6 +149,7 @@ make test-purge          # purge macOS test secrets
 | `sv rm <KEY>` | Delete a secret |
 | `sv ls` | List secret names |
 | `sv exec -- <cmd>` | Run command with secrets injected |
+| `sv doctor` | Check backend setup and common failures |
 | `sv update` | Update to latest version |
 | `sv version` | Print version |
 | `sv help` | Show help |
