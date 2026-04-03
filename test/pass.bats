@@ -114,9 +114,10 @@ teardown() {
   run bash -c "export PASSWORD_STORE_DIR='$empty_store' GNUPGHOME='$GNUPGHOME'; '$SV_BIN' doctor"
   [ "$status" -ne 0 ]
   [[ "$output" == *"password store not initialized"* ]]
-  [[ "$output" == *"Create a key with: gpg --full-generate-key"* ]]
-  [[ "$output" == *"List keys with: gpg --list-secret-keys --keyid-format=long"* ]]
-  [[ "$output" == *"Initialize pass with: pass init <gpg-id>"* ]]
+  [[ "$output" == *"Next steps:"* ]]
+  [[ "$output" == *"gpg --full-generate-key"* ]]
+  [[ "$output" == *"gpg --list-secret-keys --keyid-format=long"* ]]
+  [[ "$output" == *"pass init <gpg-id>"* ]]
 
   rm -rf "$empty_store"
 }

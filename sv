@@ -265,6 +265,7 @@ store_ls() {
 
 DOCTOR_FAILURES=0
 DOCTOR_WARNINGS=0
+DOCTOR_NEXT_STEPS=()
 
 doctor_info() {
   printf "[info] %s\n" "$1"
@@ -285,7 +286,27 @@ doctor_fail() {
 }
 
 doctor_next() {
-  printf "[next] %s\n" "$1"
+  local step="$1"
+  local existing
+
+  for existing in "${DOCTOR_NEXT_STEPS[@]:-}"; do
+    [[ "${existing}" == "${step}" ]] && return
+  done
+
+  DOCTOR_NEXT_STEPS+=("${step}")
+}
+
+doctor_print_next_steps() {
+  local step
+
+  [[ ${#DOCTOR_NEXT_STEPS[@]} -gt 0 ]] || return 0
+
+  printf "Next steps:\n"
+  for step in "${DOCTOR_NEXT_STEPS[@]}"; do
+    printf "  %s\n" "${step}"
+  done
+
+  return 0
 }
 
 doctor_check_cmd() {
@@ -419,6 +440,7 @@ doctor_check_pass() {
 cmd_doctor() {
   DOCTOR_FAILURES=0
   DOCTOR_WARNINGS=0
+  DOCTOR_NEXT_STEPS=()
 
   doctor_info "sv version: ${SV_VERSION}"
 
@@ -429,6 +451,7 @@ cmd_doctor() {
 
   if [[ ${DOCTOR_FAILURES} -gt 0 ]]; then
     printf "sv doctor: %d failure(s), %d warning(s)\n" "${DOCTOR_FAILURES}" "${DOCTOR_WARNINGS}"
+    doctor_print_next_steps
     return 1
   fi
 
@@ -437,6 +460,8 @@ cmd_doctor() {
   else
     printf "sv doctor: ok\n"
   fi
+
+  doctor_print_next_steps
 }
 
 # ─── Manifest ─────────────────────────────────────────────────────────────────
