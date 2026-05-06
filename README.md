@@ -100,8 +100,9 @@ ANTHROPIC_API_KEY?
 
 - When present, `sv exec` only injects listed secrets and **fails if any required secrets are missing** from the active backend.
 - Add `?` to mark a secret optional. Missing optional secrets are skipped; present optional secrets are injected.
+- If a manifest has only optional entries and none are available, `sv exec` runs the command without requiring the backend to be initialized; `--strict` restores required-secret behavior.
 - Use `sv exec --strict -- <cmd>` to treat optional secrets as required for one command.
-- `sv doctor` reports required and optional manifest status separately.
+- `sv doctor` reports required and optional manifest status separately when backend checks pass.
 - When absent, all stored secrets are injected.
 - The manifest is found by searching up from the current directory, so running from a subdirectory works.
 
