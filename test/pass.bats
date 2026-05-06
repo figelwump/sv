@@ -161,6 +161,149 @@ EOF
   rm -rf "$root"
 }
 
+@test "sv exec treats hidden pass pinentry failures as unlockable" {
+  local root fakebin store_dir manifest_dir
+  root="$(mktemp -d)"
+  fakebin="${root}/bin"
+  store_dir="${root}/store"
+  manifest_dir="${root}/project"
+  mkdir -p "${fakebin}" "${store_dir}/sv" "${manifest_dir}"
+  echo "${TEST_GPG_ID}" > "${store_dir}/.gpg-id"
+  : > "${store_dir}/sv/LOCKED_KEY.gpg"
+  echo "LOCKED_KEY" > "${manifest_dir}/.secrets"
+
+  cat > "${fakebin}/pass" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "show" ]]; then
+  printf "gpg: decryption failed: No secret key\n" >&2
+  exit 1
+fi
+printf "unexpected pass call: %s\n" "$*" >&2
+exit 1
+EOF
+  chmod +x "${fakebin}/pass"
+
+  cat > "${fakebin}/gpg" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  *"--with-colons --list-secret-keys"*)
+    printf "sec:::::::::unused:\n"
+    printf "ssb::::40FB79ECFC7C5905:::::::\n"
+    exit 0
+    ;;
+  *"--list-packets"*)
+    printf ":pubkey enc packet: version 3, algo 1, keyid 40FB79ECFC7C5905\n"
+    exit 0
+    ;;
+esac
+exit 0
+EOF
+  chmod +x "${fakebin}/gpg"
+
+  run bash -c "cd '$manifest_dir' && export PATH='$fakebin':\$PATH PASSWORD_STORE_DIR='$store_dir' GNUPGHOME='$GNUPGHOME'; '$SV_BIN' exec -- echo should_not_run"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"gpg-agent is locked or cannot prompt"* ]]
+  [[ "$output" == *"ask the human user"* ]]
+  [[ "$output" == *"sv unlock LOCKED_KEY"* ]]
+  [[ "$output" != *"private GPG key is not available"* ]]
+  [[ "$output" != *"failed to resolve secret"* ]]
+
+  rm -rf "$root"
+}
+
+@test "sv exec reports missing private key when recipient is unavailable" {
+  local root fakebin store_dir manifest_dir
+  root="$(mktemp -d)"
+  fakebin="${root}/bin"
+  store_dir="${root}/store"
+  manifest_dir="${root}/project"
+  mkdir -p "${fakebin}" "${store_dir}/sv" "${manifest_dir}"
+  echo "${TEST_GPG_ID}" > "${store_dir}/.gpg-id"
+  : > "${store_dir}/sv/MISSING_PRIVATE_KEY.gpg"
+  echo "MISSING_PRIVATE_KEY" > "${manifest_dir}/.secrets"
+
+  cat > "${fakebin}/pass" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "show" ]]; then
+  printf "gpg: decryption failed: No secret key\n" >&2
+  exit 1
+fi
+printf "unexpected pass call: %s\n" "$*" >&2
+exit 1
+EOF
+  chmod +x "${fakebin}/pass"
+
+  cat > "${fakebin}/gpg" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  *"--with-colons --list-secret-keys"*)
+    printf "ssb::::40FB79ECFC7C5905:::::::\n"
+    exit 0
+    ;;
+  *"--list-packets"*)
+    printf ":pubkey enc packet: version 3, algo 1, keyid 1111222233334444\n"
+    exit 0
+    ;;
+esac
+exit 0
+EOF
+  chmod +x "${fakebin}/gpg"
+
+  run bash -c "cd '$manifest_dir' && export PATH='$fakebin':\$PATH PASSWORD_STORE_DIR='$store_dir' GNUPGHOME='$GNUPGHOME'; '$SV_BIN' exec -- echo should_not_run"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"private GPG key is not available"* ]]
+  [[ "$output" == *"sv doctor"* ]]
+  [[ "$output" != *"ask the human user"* ]]
+
+  rm -rf "$root"
+}
+
+@test "sv exec preserves no-secret-key error when recipient inspection is inconclusive" {
+  local root fakebin store_dir manifest_dir
+  root="$(mktemp -d)"
+  fakebin="${root}/bin"
+  store_dir="${root}/store"
+  manifest_dir="${root}/project"
+  mkdir -p "${fakebin}" "${store_dir}/sv" "${manifest_dir}"
+  echo "${TEST_GPG_ID}" > "${store_dir}/.gpg-id"
+  : > "${store_dir}/sv/UNKNOWN_RECIPIENT.gpg"
+  echo "UNKNOWN_RECIPIENT" > "${manifest_dir}/.secrets"
+
+  cat > "${fakebin}/pass" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "show" ]]; then
+  printf "gpg: decryption failed: No secret key\n" >&2
+  exit 1
+fi
+printf "unexpected pass call: %s\n" "$*" >&2
+exit 1
+EOF
+  chmod +x "${fakebin}/pass"
+
+  cat > "${fakebin}/gpg" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  *"--with-colons --list-secret-keys"*)
+    printf "ssb::::40FB79ECFC7C5905:::::::\n"
+    exit 0
+    ;;
+  *"--list-packets"*)
+    exit 2
+    ;;
+esac
+exit 0
+EOF
+  chmod +x "${fakebin}/gpg"
+
+  run bash -c "cd '$manifest_dir' && export PATH='$fakebin':\$PATH PASSWORD_STORE_DIR='$store_dir' GNUPGHOME='$GNUPGHOME'; '$SV_BIN' exec -- echo should_not_run"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"failed to read UNKNOWN_RECIPIENT from the Linux password store: gpg: decryption failed: No secret key"* ]]
+  [[ "$output" != *"private GPG key is not available"* ]]
+  [[ "$output" != *"ask the human user"* ]]
+
+  rm -rf "$root"
+}
+
 @test "sv unlock reports interactive pinentry failures as human action" {
   command -v script >/dev/null 2>&1 || skip "script command not found"
 
