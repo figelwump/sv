@@ -148,14 +148,48 @@ exit 1
 EOF
   chmod +x "${fakebin}/pass"
 
-  run bash -c "cd '$manifest_dir' && export PATH='$fakebin':\$PATH PASSWORD_STORE_DIR='$store_dir' GNUPGHOME='$GNUPGHOME' FAKE_PASS_ERROR='gpg: public key decryption failed: Inappropriate ioctl for device'; '$SV_BIN' exec -- echo should_not_run"
+  run bash -c "cd '$manifest_dir' && export PATH='$fakebin':\$PATH PASSWORD_STORE_DIR='$store_dir' GNUPGHOME='$GNUPGHOME'; FAKE_PASS_ERROR=\$'gpg: public key decryption failed: Inappropriate ioctl for device\ngpg: decryption failed: No secret key' '$SV_BIN' exec -- echo should_not_run"
   [ "$status" -ne 0 ]
   [[ "$output" == *"failed to read LOCKED_KEY;PWNED"* ]]
   [[ "$output" == *"gpg-agent is locked or cannot prompt"* ]]
   [[ "$output" == *"ask the human user"* ]]
+  [[ "$output" != *"private GPG key is not available"* ]]
   printf "%s" "$output" | grep -F "sv unlock LOCKED_KEY\\;PWNED" >/dev/null
   [[ "$output" != *"sv unlock LOCKED_KEY;PWNED"* ]]
   [[ "$output" != *"failed to resolve secret"* ]]
+
+  rm -rf "$root"
+}
+
+@test "sv unlock reports interactive pinentry failures as human action" {
+  command -v script >/dev/null 2>&1 || skip "script command not found"
+
+  local root fakebin store_dir
+  root="$(mktemp -d)"
+  fakebin="${root}/bin"
+  store_dir="${root}/store"
+  mkdir -p "${fakebin}" "${store_dir}/sv"
+  echo "${TEST_GPG_ID}" > "${store_dir}/.gpg-id"
+  : > "${store_dir}/sv/LOCKED_KEY.gpg"
+
+  cat > "${fakebin}/pass" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "show" ]]; then
+  printf "gpg: public key decryption failed: Screen or window too small\n" >&2
+  printf "gpg: decryption failed: No secret key\n" >&2
+  exit 1
+fi
+printf "unexpected pass call: %s\n" "$*" >&2
+exit 1
+EOF
+  chmod +x "${fakebin}/pass"
+
+  run script -q -e -c "export PATH='$fakebin':\$PATH PASSWORD_STORE_DIR='$store_dir' GNUPGHOME='$GNUPGHOME' SV_SERVICE_PREFIX='$SV_SERVICE_PREFIX'; '$SV_BIN' unlock LOCKED_KEY" /dev/null
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"gpg-agent is locked or cannot prompt"* ]]
+  [[ "$output" == *"human action"* ]]
+  [[ "$output" == *"sv unlock LOCKED_KEY"* ]]
+  [[ "$output" != *"private GPG key is not available"* ]]
 
   rm -rf "$root"
 }

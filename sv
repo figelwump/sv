@@ -156,7 +156,7 @@ pass_failure_is_prompt_error() {
   local err="$1"
 
   case "$err" in
-    *"No pinentry"*|*"Inappropriate ioctl for device"*|*"Operation cancelled"*)
+    *"No pinentry"*|*"Inappropriate ioctl for device"*|*"Operation cancelled"*|*"Screen or window too small"*)
       return 0
       ;;
   esac
@@ -184,23 +184,28 @@ pass_emit_failure() {
   [[ -n "${key}" ]] && subject="${key}"
   preposition="$(pass_failure_preposition "${action}")"
 
-  if pass_failure_is_missing_key_error "${err}"; then
-    printf "sv: failed to %s %s %s the Linux password store because the private GPG key is not available.\n" "${action}" "${subject}" "${preposition}" >&2
-    printf "sv: run 'sv doctor' on the Linux host to check the password-store and GPG setup.\n" >&2
-    return
-  fi
-
   if pass_failure_is_prompt_error "${err}"; then
     printf "sv: failed to %s %s %s the Linux password store because gpg-agent is locked or cannot prompt in this session.\n" "${action}" "${subject}" "${preposition}" >&2
     if [[ -n "${key}" ]]; then
-      printf -v quoted_pwd "%q" "${PWD}"
       printf -v quoted_key "%q" "${key}"
-      printf "sv: agent action: ask the human user to open an interactive SSH terminal and run:\n" >&2
-      printf "sv:   cd %s && sv unlock %s\n" "${quoted_pwd}" "${quoted_key}" >&2
-      printf "sv: then retry this command.\n" >&2
+      if [[ -t 0 && -t 2 ]]; then
+        printf "sv: human action: make sure this SSH terminal can show pinentry, then run:\n" >&2
+        printf "sv:   sv unlock %s\n" "${quoted_key}" >&2
+      else
+        printf -v quoted_pwd "%q" "${PWD}"
+        printf "sv: agent action: ask the human user to open an interactive SSH terminal and run:\n" >&2
+        printf "sv:   cd %s && sv unlock %s\n" "${quoted_pwd}" "${quoted_key}" >&2
+        printf "sv: then retry this command.\n" >&2
+      fi
     else
       printf "sv: agent action: ask the human user to run 'sv unlock <KEY>' in an interactive SSH terminal, then retry this command.\n" >&2
     fi
+    return
+  fi
+
+  if pass_failure_is_missing_key_error "${err}"; then
+    printf "sv: failed to %s %s %s the Linux password store because the private GPG key is not available.\n" "${action}" "${subject}" "${preposition}" >&2
+    printf "sv: run 'sv doctor' on the Linux host to check the password-store and GPG setup.\n" >&2
     return
   fi
 
