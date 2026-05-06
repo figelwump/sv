@@ -11,6 +11,7 @@
 #   sv rm <KEY>                Delete a secret
 #   sv ls                      List secret names (never values)
 #   sv exec -- <cmd> [args]    Run a command with secrets as env vars
+#   sv unlock <KEY>            Unlock Linux GPG agent without printing a secret
 #   sv doctor                  Check backend setup and common failures
 #   sv update                  Update sv to the latest version
 #   sv version                 Print version
@@ -26,6 +27,7 @@ readonly SV_SERVICE_PREFIX="${SV_SERVICE_PREFIX:-sv:}"
 readonly SV_KEYCHAIN_ACCOUNT="${USER}"
 readonly SV_MANIFEST=".secrets"
 readonly SV_PASS_NAMESPACE="sv"
+readonly SV_BACKEND_FAILURE_STATUS=2
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -117,6 +119,21 @@ pass_store_initialized() {
   [[ -f "$(pass_store_dir)/.gpg-id" ]]
 }
 
+pass_prepare_tty() {
+  local tty_name
+
+  [[ -t 0 ]] || return 0
+
+  tty_name="$(tty 2>/dev/null || true)"
+  [[ -n "${tty_name}" && "${tty_name}" != "not a tty" ]] || return 0
+
+  export GPG_TTY="${tty_name}"
+
+  if command -v gpg-connect-agent >/dev/null 2>&1; then
+    gpg-connect-agent updatestartuptty /bye >/dev/null 2>&1 || true
+  fi
+}
+
 pass_require_ready() {
   need_cmd pass
   need_cmd gpg
@@ -124,23 +141,81 @@ pass_require_ready() {
   if ! pass_store_initialized; then
     die "Linux password store is not initialized. Run 'pass init <gpg-id>' before using sv."
   fi
+
+  pass_prepare_tty
 }
 
-pass_handle_failure() {
-  local action="$1" err="$2"
+pass_failure_preposition() {
+  case "$1" in
+    read) printf "from" ;;
+    *)    printf "in" ;;
+  esac
+}
+
+pass_failure_is_prompt_error() {
+  local err="$1"
 
   case "$err" in
-    *"No pinentry"*|*"Inappropriate ioctl for device"*|*"No secret key"*|*"decryption failed"*)
-      die "failed to ${action} in the Linux password store. Ensure your GPG key is available and gpg-agent can prompt or is already unlocked."
+    *"No pinentry"*|*"Inappropriate ioctl for device"*|*"Operation cancelled"*)
+      return 0
       ;;
   esac
 
-  if [[ -n "${err}" ]]; then
-    err="${err//$'\n'/ }"
-    die "failed to ${action} in the Linux password store: ${err}"
+  return 1
+}
+
+pass_failure_is_missing_key_error() {
+  local err="$1"
+
+  case "$err" in
+    *"No secret key"*|*"secret key not available"*)
+      return 0
+      ;;
+  esac
+
+  return 1
+}
+
+pass_emit_failure() {
+  local action="$1" key="$2" err="$3"
+  local subject="a secret"
+  local preposition clean_err quoted_pwd quoted_key
+
+  [[ -n "${key}" ]] && subject="${key}"
+  preposition="$(pass_failure_preposition "${action}")"
+
+  if pass_failure_is_missing_key_error "${err}"; then
+    printf "sv: failed to %s %s %s the Linux password store because the private GPG key is not available.\n" "${action}" "${subject}" "${preposition}" >&2
+    printf "sv: run 'sv doctor' on the Linux host to check the password-store and GPG setup.\n" >&2
+    return
   fi
 
-  die "failed to ${action} in the Linux password store."
+  if pass_failure_is_prompt_error "${err}"; then
+    printf "sv: failed to %s %s %s the Linux password store because gpg-agent is locked or cannot prompt in this session.\n" "${action}" "${subject}" "${preposition}" >&2
+    if [[ -n "${key}" ]]; then
+      printf -v quoted_pwd "%q" "${PWD}"
+      printf -v quoted_key "%q" "${key}"
+      printf "sv: agent action: ask the human user to open an interactive SSH terminal and run:\n" >&2
+      printf "sv:   cd %s && sv unlock %s\n" "${quoted_pwd}" "${quoted_key}" >&2
+      printf "sv: then retry this command.\n" >&2
+    else
+      printf "sv: agent action: ask the human user to run 'sv unlock <KEY>' in an interactive SSH terminal, then retry this command.\n" >&2
+    fi
+    return
+  fi
+
+  if [[ -n "${err}" ]]; then
+    clean_err="${err//$'\n'/ }"
+    printf "sv: failed to %s %s %s the Linux password store: %s\n" "${action}" "${subject}" "${preposition}" "${clean_err}" >&2
+    return
+  fi
+
+  printf "sv: failed to %s %s %s the Linux password store.\n" "${action}" "${subject}" "${preposition}" >&2
+}
+
+pass_handle_failure() {
+  pass_emit_failure "$@"
+  exit 1
 }
 
 pass_has() {
@@ -161,7 +236,7 @@ pass_set() {
   local err
   err="$(<"${err_file}")"
   rm -f "${err_file}"
-  pass_handle_failure "store a secret" "${err}"
+  pass_handle_failure "store" "${key}" "${err}"
 }
 
 pass_get() {
@@ -181,7 +256,8 @@ pass_get() {
   local err
   err="$(<"${err_file}")"
   rm -f "${err_file}"
-  pass_handle_failure "read a secret" "${err}"
+  pass_emit_failure "read" "${key}" "${err}"
+  return "${SV_BACKEND_FAILURE_STATUS}"
 }
 
 pass_rm() {
@@ -431,7 +507,10 @@ doctor_check_pass() {
     doctor_warn "no pinentry program found in PATH. $(linux_install_hint)"
   fi
 
-  if [[ -t 1 && -z "${GPG_TTY:-}" ]]; then
+  if [[ ! -t 0 || ! -t 2 ]]; then
+    doctor_warn "session is non-interactive. If gpg-agent is locked, sv exec cannot satisfy a GPG prompt here."
+    doctor_next "Agent action: ask the human user to run 'sv unlock <KEY>' in an interactive SSH terminal before retrying non-interactive sv exec."
+  elif [[ -z "${GPG_TTY:-}" ]]; then
     doctor_warn "GPG_TTY is not set. Some terminal sessions need: export GPG_TTY=\$(tty)"
     doctor_next "Set it in this shell with: export GPG_TTY=\$(tty)"
   fi
@@ -578,8 +657,47 @@ cmd_get() {
   fi
 
   local value
-  value="$(store_get "$key")" || die "secret not found: $key"
-  printf "%s\n" "$value"
+  if value="$(store_get "$key")"; then
+    printf "%s\n" "$value"
+    return 0
+  else
+    local status=$?
+    [[ "${status}" -eq "${SV_BACKEND_FAILURE_STATUS}" ]] && return 1
+
+    die "secret not found: $key"
+  fi
+}
+
+cmd_unlock() {
+  local key="${1:-}"
+  local quoted_key
+
+  [[ -z "$key" || $# -gt 1 ]] && die "usage: sv unlock <KEY>"
+
+  if [[ "${SV_BACKEND}" != "pass" ]]; then
+    die "sv unlock is only needed on Linux password-store"
+  fi
+
+  if [[ ! -t 0 || ! -t 2 ]]; then
+    printf -v quoted_key "%q" "${key}"
+    die "sv unlock requires an interactive terminal. Agent action: ask the human user to run 'sv unlock ${quoted_key}' in an interactive SSH terminal, then retry the original command."
+  fi
+
+  store_require_ready
+
+  if ! store_has "$key"; then
+    die "secret not found: $key"
+  fi
+
+  if store_get "$key" >/dev/null; then
+    printf "sv: unlocked Linux password store for %s\n" "$key" >&2
+    return 0
+  else
+    local status=$?
+    [[ "${status}" -eq "${SV_BACKEND_FAILURE_STATUS}" ]] && return 1
+
+    die "secret not found: $key"
+  fi
 }
 
 cmd_rm() {
@@ -614,8 +732,15 @@ cmd_exec() {
   local env_args=()
   while IFS= read -r key; do
     local value
-    value="$(store_get "$key")" || die "failed to resolve secret: $key"
-    env_args+=("${key}=${value}")
+    if value="$(store_get "$key")"; then
+      env_args+=("${key}=${value}")
+      continue
+    else
+      local status=$?
+      [[ "${status}" -eq "${SV_BACKEND_FAILURE_STATUS}" ]] && return 1
+
+      die "failed to resolve secret: $key"
+    fi
   done <<< "$names"
 
   # Use env to inject and exec the command
@@ -668,6 +793,7 @@ Usage:
   sv rm <KEY>                Delete a secret
   sv ls                      List secret names (never values)
   sv exec -- <cmd> [args]    Run a command with secrets as env vars
+  sv unlock <KEY>            Unlock Linux GPG agent without printing a secret
   sv doctor                  Check backend setup and common failures
   sv update                  Update sv to the latest version
   sv version                 Print version
@@ -691,6 +817,7 @@ Examples:
   sv ls                                   # shows: OPENAI_API_KEY
   sv exec -- npm run dev                  # runs with secrets injected
   sv exec -- node test.js                 # same
+  sv unlock OPENAI_API_KEY                # Linux: warm gpg-agent interactively
 
 Agent usage:
   Agents should prefix commands with sv exec -- to get secrets without
@@ -713,6 +840,7 @@ shift || true
 case "$cmd" in
   set)        cmd_set "$@" ;;
   get)        cmd_get "$@" ;;
+  unlock)     cmd_unlock "$@" ;;
   rm|remove)  cmd_rm "$@" ;;
   ls|list)    cmd_ls ;;
   doctor)     cmd_doctor ;;

@@ -78,6 +78,13 @@ Notes:
 - `sv doctor` is the main troubleshooting command for Linux setup and session issues.
 - On headless Linux or Raspberry Pi, `sv set`, `sv get`, and `sv exec` may require an already-unlocked `gpg-agent`.
 - Linux agent usage is not fully fire-and-forget after a fresh boot. In practice, a human usually needs to unlock `gpg-agent` once in a real terminal session before agents can use `sv exec` non-interactively.
+- To unlock without printing a value, run `sv unlock <KEY>` from an interactive terminal. Over SSH, use a TTY:
+
+  ```bash
+  ssh -t pi 'cd /home/figelwump/vishal/repos/heybox && sv unlock TEST_KEY'
+  ```
+
+  After that, non-interactive agent commands can retry `sv exec` until `gpg-agent` cache expires or the Pi reboots.
 - If `sv` says the Linux password store is not initialized, initialize it with `pass init <gpg-id>` first.
 
 ## Project manifests
@@ -103,7 +110,19 @@ sv exec -- npm test
 sv exec -- node scripts/call-api.js
 ```
 
-On Linux, this assumes `gpg-agent` is already unlocked in the current session. If it is not, `sv exec` may trigger a passphrase prompt or fail in non-interactive contexts.
+On Linux, this assumes `gpg-agent` is already unlocked in the current session. If it is not, `sv exec` may fail in non-interactive SSH contexts before the target command starts. In that case, the agent should ask the human user to run the unlock step in an interactive SSH terminal:
+
+```bash
+ssh -t pi 'cd /home/figelwump/vishal/repos/heybox && sv unlock TEST_KEY'
+```
+
+Then the agent can retry:
+
+```bash
+ssh pi 'cd /home/figelwump/vishal/repos/heybox && sv exec -- .venv/bin/python scripts/list_spotify_devices.py'
+```
+
+Fully unattended Linux use requires an explicit security tradeoff, such as a no-passphrase dedicated GPG key or separate host-level unlock automation. That is not `sv`'s default.
 
 Add to your project's `AGENTS.md`:
 
@@ -149,6 +168,7 @@ make test-purge          # purge macOS test secrets
 | `sv rm <KEY>` | Delete a secret |
 | `sv ls` | List secret names |
 | `sv exec -- <cmd>` | Run command with secrets injected |
+| `sv unlock <KEY>` | Unlock Linux GPG agent without printing a secret |
 | `sv doctor` | Check backend setup and common failures |
 | `sv update` | Update to latest version |
 | `sv version` | Print version |

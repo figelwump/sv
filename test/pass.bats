@@ -65,6 +65,32 @@ teardown() {
   [[ "$output" == *"no secrets stored"* ]]
 }
 
+@test "sv unlock requires a key" {
+  run "$SV_BIN" unlock
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"usage: sv unlock <KEY>"* ]]
+}
+
+@test "sv unlock requires an interactive terminal" {
+  test_pass_set UNLOCK_KEY "secret_unlock_value"
+
+  run "$SV_BIN" unlock UNLOCK_KEY
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"requires an interactive terminal"* ]]
+  [[ "$output" == *"ask the human user"* ]]
+  [[ "$output" != *"secret_unlock_value"* ]]
+}
+
+@test "sv unlock warms gpg-agent without printing the secret" {
+  command -v script >/dev/null 2>&1 || skip "script command not found"
+  test_pass_set UNLOCK_KEY "secret_unlock_value"
+
+  run script -q -e -c "export PASSWORD_STORE_DIR='$PASSWORD_STORE_DIR' GNUPGHOME='$GNUPGHOME' SV_SERVICE_PREFIX='$SV_SERVICE_PREFIX'; '$SV_BIN' unlock UNLOCK_KEY" /dev/null
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"unlocked Linux password store for UNLOCK_KEY"* ]]
+  [[ "$output" != *"secret_unlock_value"* ]]
+}
+
 @test "sv set requires an initialized password-store" {
   local empty_store
   empty_store="$(mktemp -d)"
@@ -98,6 +124,71 @@ teardown() {
   [[ "$output" == *"password store is not initialized"* ]]
 
   rm -rf "$empty_store" "$manifest_dir"
+}
+
+@test "sv exec reports locked gpg-agent with human unlock instruction once" {
+  local root fakebin store_dir manifest_dir
+  root="$(mktemp -d)"
+  fakebin="${root}/bin"
+  store_dir="${root}/store"
+  manifest_dir="${root}/project"
+  mkdir -p "${fakebin}" "${store_dir}/sv" "${manifest_dir}"
+  echo "${TEST_GPG_ID}" > "${store_dir}/.gpg-id"
+  : > "${store_dir}/sv/LOCKED_KEY;PWNED.gpg"
+  echo "LOCKED_KEY;PWNED" > "${manifest_dir}/.secrets"
+
+  cat > "${fakebin}/pass" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "show" ]]; then
+  printf "%s\n" "${FAKE_PASS_ERROR:-fake pass failure}" >&2
+  exit 1
+fi
+printf "unexpected pass call: %s\n" "$*" >&2
+exit 1
+EOF
+  chmod +x "${fakebin}/pass"
+
+  run bash -c "cd '$manifest_dir' && export PATH='$fakebin':\$PATH PASSWORD_STORE_DIR='$store_dir' GNUPGHOME='$GNUPGHOME' FAKE_PASS_ERROR='gpg: public key decryption failed: Inappropriate ioctl for device'; '$SV_BIN' exec -- echo should_not_run"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"failed to read LOCKED_KEY;PWNED"* ]]
+  [[ "$output" == *"gpg-agent is locked or cannot prompt"* ]]
+  [[ "$output" == *"ask the human user"* ]]
+  printf "%s" "$output" | grep -F "sv unlock LOCKED_KEY\\;PWNED" >/dev/null
+  [[ "$output" != *"sv unlock LOCKED_KEY;PWNED"* ]]
+  [[ "$output" != *"failed to resolve secret"* ]]
+
+  rm -rf "$root"
+}
+
+@test "sv exec preserves unrecognized password-store errors" {
+  local root fakebin store_dir manifest_dir
+  root="$(mktemp -d)"
+  fakebin="${root}/bin"
+  store_dir="${root}/store"
+  manifest_dir="${root}/project"
+  mkdir -p "${fakebin}" "${store_dir}/sv" "${manifest_dir}"
+  echo "${TEST_GPG_ID}" > "${store_dir}/.gpg-id"
+  : > "${store_dir}/sv/ODD_KEY.gpg"
+  echo "ODD_KEY" > "${manifest_dir}/.secrets"
+
+  cat > "${fakebin}/pass" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "show" ]]; then
+  printf "%s\n" "${FAKE_PASS_ERROR:-fake pass failure}" >&2
+  exit 1
+fi
+printf "unexpected pass call: %s\n" "$*" >&2
+exit 1
+EOF
+  chmod +x "${fakebin}/pass"
+
+  run bash -c "cd '$manifest_dir' && export PATH='$fakebin':\$PATH PASSWORD_STORE_DIR='$store_dir' GNUPGHOME='$GNUPGHOME' FAKE_PASS_ERROR='gpg: decryption failed: Bad session key'; '$SV_BIN' exec -- echo should_not_run"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"failed to read ODD_KEY from the Linux password store: gpg: decryption failed: Bad session key"* ]]
+  [[ "$output" != *"ask the human user"* ]]
+  [[ "$output" != *"failed to resolve secret"* ]]
+
+  rm -rf "$root"
 }
 
 @test "sv doctor reports pass backend health" {

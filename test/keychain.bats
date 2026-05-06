@@ -76,6 +76,12 @@ teardown() {
   [[ "$output" == *"no secrets stored"* ]]
 }
 
+@test "sv unlock is Linux-only on macOS" {
+  run "$SV_BIN" unlock ANY_KEY
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"sv unlock is only needed on Linux password-store"* ]]
+}
+
 @test "round-trip: set → ls → rm → verify gone" {
   echo "roundtrip_val" | "$SV_BIN" set ROUND_TRIP_KEY
   # ls should show it
