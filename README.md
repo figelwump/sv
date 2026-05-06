@@ -95,9 +95,13 @@ Create a `.secrets` file in your project root listing the secret names it needs:
 # .secrets — commit this file, it contains no values
 OPENAI_API_KEY
 DATABASE_URL
+ANTHROPIC_API_KEY?
 ```
 
-- When present, `sv exec` only injects listed secrets and **fails if any are missing** from the active backend.
+- When present, `sv exec` only injects listed secrets and **fails if any required secrets are missing** from the active backend.
+- Add `?` to mark a secret optional. Missing optional secrets are skipped; present optional secrets are injected.
+- Use `sv exec --strict -- <cmd>` to treat optional secrets as required for one command.
+- `sv doctor` reports required and optional manifest status separately.
 - When absent, all stored secrets are injected.
 - The manifest is found by searching up from the current directory, so running from a subdirectory works.
 
@@ -167,7 +171,7 @@ make test-purge          # purge macOS test secrets
 | `sv get <KEY>` | Print a secret value (TTY only) |
 | `sv rm <KEY>` | Delete a secret |
 | `sv ls` | List secret names |
-| `sv exec -- <cmd>` | Run command with secrets injected |
+| `sv exec [--strict] -- <cmd>` | Run command with secrets injected |
 | `sv unlock <KEY>` | Unlock Linux GPG agent without printing a secret |
 | `sv doctor` | Check backend setup and common failures |
 | `sv update` | Update to latest version |

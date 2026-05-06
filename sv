@@ -10,7 +10,8 @@
 #   sv get <KEY>               Print a secret value (interactive TTY only)
 #   sv rm <KEY>                Delete a secret
 #   sv ls                      List secret names (never values)
-#   sv exec -- <cmd> [args]    Run a command with secrets as env vars
+#   sv exec [--strict] -- <cmd> [args]
+#                               Run a command with secrets as env vars
 #   sv unlock <KEY>            Unlock Linux GPG agent without printing a secret
 #   sv doctor                  Check backend setup and common failures
 #   sv update                  Update sv to the latest version
@@ -20,7 +21,7 @@
 
 set -euo pipefail
 
-readonly SV_VERSION="0.1.4"
+readonly SV_VERSION="0.1.5"
 readonly SV_REPO="figelwump/sv"
 readonly SV_RAW_URL="https://raw.githubusercontent.com/${SV_REPO}/main/sv"
 readonly SV_SERVICE_PREFIX="${SV_SERVICE_PREFIX:-sv:}"
@@ -80,6 +81,13 @@ kc_get() {
     -a "${SV_KEYCHAIN_ACCOUNT}" \
     -s "${SV_SERVICE_PREFIX}${key}" \
     -w 2>/dev/null
+}
+
+kc_has() {
+  local key="$1"
+  security find-generic-password \
+    -a "${SV_KEYCHAIN_ACCOUNT}" \
+    -s "${SV_SERVICE_PREFIX}${key}" >/dev/null 2>&1
 }
 
 # Delete a secret from the Keychain.
@@ -330,7 +338,7 @@ store_require_ready() {
 
 store_has() {
   case "${SV_BACKEND}" in
-    keychain) kc_get "$1" >/dev/null 2>&1 ;;
+    keychain) kc_has "$1" ;;
     pass)     pass_has "$1" ;;
   esac
 }
@@ -553,6 +561,65 @@ doctor_check_pass() {
   fi
 }
 
+doctor_check_manifest() {
+  local manifest_path manifest_entries
+  manifest_path="$(find_manifest)"
+
+  [[ -n "${manifest_path}" ]] || return 0
+
+  doctor_info "project manifest: ${manifest_path}"
+
+  if [[ ${DOCTOR_FAILURES} -gt 0 ]]; then
+    doctor_info "project manifest status skipped because backend checks failed"
+    return 0
+  fi
+
+  manifest_entries="$(read_manifest "${manifest_path}")"
+  if [[ -z "${manifest_entries}" ]]; then
+    doctor_ok "project manifest has no active entries"
+    return 0
+  fi
+
+  local entry key
+  local required_present=()
+  local required_missing=()
+  local optional_present=()
+  local optional_missing=()
+
+  while IFS= read -r entry; do
+    key="$(manifest_entry_key "${entry}")"
+    if manifest_entry_is_optional "${entry}"; then
+      if store_has "${key}"; then
+        optional_present+=("${key}")
+      else
+        optional_missing+=("${key}")
+      fi
+    else
+      if store_has "${key}"; then
+        required_present+=("${key}")
+      else
+        required_missing+=("${key}")
+      fi
+    fi
+  done <<< "${manifest_entries}"
+
+  if [[ ${#required_missing[@]} -gt 0 ]]; then
+    doctor_fail "required secrets missing: ${required_missing[*]}"
+  elif [[ ${#required_present[@]} -gt 0 ]]; then
+    doctor_ok "required secrets available: ${required_present[*]}"
+  else
+    doctor_ok "no required secrets listed"
+  fi
+
+  if [[ ${#optional_missing[@]} -gt 0 ]]; then
+    doctor_info "optional secrets missing: ${optional_missing[*]}"
+  fi
+
+  if [[ ${#optional_present[@]} -gt 0 ]]; then
+    doctor_ok "optional secrets available: ${optional_present[*]}"
+  fi
+}
+
 cmd_doctor() {
   DOCTOR_FAILURES=0
   DOCTOR_WARNINGS=0
@@ -564,6 +631,8 @@ cmd_doctor() {
     keychain) doctor_check_keychain ;;
     pass)     doctor_check_pass ;;
   esac
+
+  doctor_check_manifest
 
   if [[ ${DOCTOR_FAILURES} -gt 0 ]]; then
     printf "sv doctor: %d failure(s), %d warning(s)\n" "${DOCTOR_FAILURES}" "${DOCTOR_WARNINGS}"
@@ -595,7 +664,7 @@ find_manifest() {
   done
 }
 
-# Read secret names from a .secrets manifest file.
+# Read manifest entries from a .secrets manifest file.
 # Skips blank lines and comments (#).
 read_manifest() {
   local manifest_path="$1"
@@ -612,37 +681,69 @@ read_manifest() {
   done < "${manifest_path}"
 }
 
+manifest_entry_key() {
+  local entry="$1"
+  if [[ "${entry}" == *\? ]]; then
+    printf "%s\n" "${entry%\?}"
+  else
+    printf "%s\n" "${entry}"
+  fi
+}
+
+manifest_entry_is_optional() {
+  [[ "$1" == *\? ]]
+}
+
 # ─── Resolve which secrets to inject ──────────────────────────────────────────
 
 # If a .secrets manifest is found (searching up from cwd), use it to scope.
 # Otherwise, inject all sv secrets.
-# Fails if a manifest lists a key not found in the active backend.
+# Fails if a required manifest key is not found in the active backend.
 resolve_secret_names() {
+  local strict="${1:-0}"
   local manifest_path
   manifest_path="$(find_manifest)"
 
   if [[ -n "${manifest_path}" ]]; then
-    local manifest_keys
-    manifest_keys="$(read_manifest "${manifest_path}")"
-    if [[ -z "${manifest_keys}" ]]; then
+    local manifest_entries
+    manifest_entries="$(read_manifest "${manifest_path}")"
+    if [[ -z "${manifest_entries}" ]]; then
       return
     fi
 
-    store_require_ready
-
-    # Validate every manifest key exists in the active backend
-    local missing=()
-    while IFS= read -r key; do
-      if ! store_has "$key"; then
-        missing+=("$key")
+    local entry key has_required=0
+    while IFS= read -r entry; do
+      if [[ "${strict}" -eq 1 ]] || ! manifest_entry_is_optional "${entry}"; then
+        has_required=1
+        break
       fi
-    done <<< "$manifest_keys"
+    done <<< "${manifest_entries}"
+
+    if [[ "${has_required}" -eq 1 ]]; then
+      store_require_ready
+    fi
+
+    local missing=()
+    local resolved=()
+    while IFS= read -r entry; do
+      key="$(manifest_entry_key "${entry}")"
+      if store_has "${key}"; then
+        resolved+=("${key}")
+        continue
+      fi
+
+      if [[ "${strict}" -eq 1 ]] || ! manifest_entry_is_optional "${entry}"; then
+        missing+=("${key}")
+      fi
+    done <<< "${manifest_entries}"
 
     if [[ ${#missing[@]} -gt 0 ]]; then
       die "missing required secrets (listed in ${manifest_path}): ${missing[*]}"
     fi
 
-    printf "%s\n" "${manifest_keys}"
+    if [[ ${#resolved[@]} -gt 0 ]]; then
+      printf "%s\n" "${resolved[@]}"
+    fi
   else
     store_ls
   fi
@@ -756,9 +857,12 @@ cmd_ls() {
 }
 
 cmd_exec() {
+  local strict="$1"
+  shift
+
   # Collect env vars
   local names
-  names="$(resolve_secret_names)"
+  names="$(resolve_secret_names "${strict}")"
 
   if [[ -z "$names" ]]; then
     # No secrets to inject, just run the command
@@ -829,7 +933,8 @@ Usage:
   sv get <KEY>               Print a secret value (TTY only — blocked when piped)
   sv rm <KEY>                Delete a secret
   sv ls                      List secret names (never values)
-  sv exec -- <cmd> [args]    Run a command with secrets as env vars
+  sv exec [--strict] -- <cmd> [args]
+                             Run a command with secrets as env vars
   sv unlock <KEY>            Unlock Linux GPG agent without printing a secret
   sv doctor                  Check backend setup and common failures
   sv update                  Update sv to the latest version
@@ -842,9 +947,12 @@ Project manifests:
     # .secrets
     OPENAI_API_KEY
     DATABASE_URL
+    ANTHROPIC_API_KEY?
 
   When present, sv exec only injects listed secrets and fails if any
-  are missing from the active backend. When absent, all stored secrets are injected.
+  required secrets are missing from the active backend. Optional entries
+  use a trailing ? and are skipped when missing. Use sv exec --strict --
+  to treat optional entries as required. When absent, all stored secrets are injected.
 
   The manifest is found by searching up from the current directory.
 
@@ -882,10 +990,15 @@ case "$cmd" in
   ls|list)    cmd_ls ;;
   doctor)     cmd_doctor ;;
   exec)
+    exec_strict=0
+    if [[ "${1:-}" == "--strict" ]]; then
+      exec_strict=1
+      shift
+    fi
     # Skip the -- separator if present
     [[ "${1:-}" == "--" ]] && shift
     [[ $# -eq 0 ]] && die "usage: sv exec -- <command> [args...]"
-    cmd_exec "$@"
+    cmd_exec "${exec_strict}" "$@"
     ;;
   update)    cmd_update ;;
   version|--version|-v)

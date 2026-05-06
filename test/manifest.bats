@@ -65,6 +65,45 @@ teardown() {
   [[ "$output" == *"DOES_NOT_EXIST"* ]]
 }
 
+@test "manifest skips missing optional secret" {
+  test_store_set REQUIRED_KEY "required_val"
+  printf "REQUIRED_KEY\nOPTIONAL_KEY?\n" > "$TEST_TMPDIR/.secrets"
+
+  run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec -- bash -c 'printf \"%s:%s\" \"\$REQUIRED_KEY\" \"\${OPTIONAL_KEY-unset}\"'"
+  [ "$status" -eq 0 ]
+  [ "$output" = "required_val:unset" ]
+}
+
+@test "manifest injects optional secret when present" {
+  test_store_set OPTIONAL_KEY "optional_val"
+  echo "OPTIONAL_KEY?" > "$TEST_TMPDIR/.secrets"
+
+  run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec -- printenv OPTIONAL_KEY"
+  [ "$status" -eq 0 ]
+  [ "$output" = "optional_val" ]
+}
+
+@test "sv exec strict treats optional secret as required" {
+  echo "OPTIONAL_KEY?" > "$TEST_TMPDIR/.secrets"
+
+  run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec --strict -- echo should_not_run"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"missing required secrets"* ]]
+  [[ "$output" == *"OPTIONAL_KEY"* ]]
+}
+
+@test "sv doctor reports required and optional manifest status separately" {
+  test_store_set PRESENT_REQUIRED "required_val"
+  test_store_set PRESENT_OPTIONAL "optional_val"
+  printf "PRESENT_REQUIRED\nMISSING_REQUIRED\nPRESENT_OPTIONAL?\nMISSING_OPTIONAL?\n" > "$TEST_TMPDIR/.secrets"
+
+  run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' doctor"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"required secrets missing: MISSING_REQUIRED"* ]]
+  [[ "$output" == *"optional secrets missing: MISSING_OPTIONAL"* ]]
+  [[ "$output" == *"optional secrets available: PRESENT_OPTIONAL"* ]]
+}
+
 @test "empty manifest injects nothing, just runs command" {
   test_store_set SOME_KEY "some_val"
   # Manifest exists but is empty

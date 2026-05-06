@@ -126,6 +126,47 @@ teardown() {
   rm -rf "$empty_store" "$manifest_dir"
 }
 
+@test "sv exec with optional-only manifest runs when password-store is uninitialized" {
+  local empty_store manifest_dir
+  empty_store="$(mktemp -d)"
+  manifest_dir="$(mktemp -d)"
+  echo "OPTIONAL_KEY?" > "${manifest_dir}/.secrets"
+
+  run bash -c "cd '$manifest_dir' && export PASSWORD_STORE_DIR='$empty_store' GNUPGHOME='$GNUPGHOME'; '$SV_BIN' exec -- echo pass_through"
+  [ "$status" -eq 0 ]
+  [ "$output" = "pass_through" ]
+
+  rm -rf "$empty_store" "$manifest_dir"
+}
+
+@test "sv exec strict with optional-only manifest requires initialized password-store" {
+  local empty_store manifest_dir
+  empty_store="$(mktemp -d)"
+  manifest_dir="$(mktemp -d)"
+  echo "OPTIONAL_KEY?" > "${manifest_dir}/.secrets"
+
+  run bash -c "cd '$manifest_dir' && export PASSWORD_STORE_DIR='$empty_store' GNUPGHOME='$GNUPGHOME'; '$SV_BIN' exec --strict -- echo should_not_run"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"password store is not initialized"* ]]
+
+  rm -rf "$empty_store" "$manifest_dir"
+}
+
+@test "sv doctor skips manifest status when password-store checks fail" {
+  local empty_store manifest_dir
+  empty_store="$(mktemp -d)"
+  manifest_dir="$(mktemp -d)"
+  printf "REQUIRED_KEY\nOPTIONAL_KEY?\n" > "${manifest_dir}/.secrets"
+
+  run bash -c "cd '$manifest_dir' && export PASSWORD_STORE_DIR='$empty_store' GNUPGHOME='$GNUPGHOME'; '$SV_BIN' doctor"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"password store not initialized"* ]]
+  [[ "$output" == *"project manifest status skipped because backend checks failed"* ]]
+  [[ "$output" != *"required secrets missing"* ]]
+
+  rm -rf "$empty_store" "$manifest_dir"
+}
+
 @test "sv exec reports locked gpg-agent with human unlock instruction once" {
   local root fakebin store_dir manifest_dir
   root="$(mktemp -d)"
