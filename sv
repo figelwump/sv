@@ -20,7 +20,7 @@
 
 set -euo pipefail
 
-readonly SV_VERSION="0.1.3"
+readonly SV_VERSION="0.1.4"
 readonly SV_REPO="figelwump/sv"
 readonly SV_RAW_URL="https://raw.githubusercontent.com/${SV_REPO}/main/sv"
 readonly SV_SERVICE_PREFIX="${SV_SERVICE_PREFIX:-sv:}"
@@ -148,6 +148,11 @@ pass_require_ready() {
 
 pass_show_with_timeout() {
   local key="$1"
+
+  if [[ -t 0 && -t 2 ]]; then
+    pass show "$(pass_entry_path "$key")"
+    return
+  fi
 
   if command -v timeout >/dev/null 2>&1; then
     timeout "${SV_PASS_TIMEOUT_SECONDS}" pass show "$(pass_entry_path "$key")"
