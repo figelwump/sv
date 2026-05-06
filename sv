@@ -20,7 +20,7 @@
 
 set -euo pipefail
 
-readonly SV_VERSION="0.1.1"
+readonly SV_VERSION="0.1.3"
 readonly SV_REPO="figelwump/sv"
 readonly SV_RAW_URL="https://raw.githubusercontent.com/${SV_REPO}/main/sv"
 readonly SV_SERVICE_PREFIX="${SV_SERVICE_PREFIX:-sv:}"
@@ -28,6 +28,7 @@ readonly SV_KEYCHAIN_ACCOUNT="${USER}"
 readonly SV_MANIFEST=".secrets"
 readonly SV_PASS_NAMESPACE="sv"
 readonly SV_BACKEND_FAILURE_STATUS=2
+readonly SV_PASS_TIMEOUT_SECONDS="${SV_PASS_TIMEOUT_SECONDS:-8}"
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -145,6 +146,17 @@ pass_require_ready() {
   pass_prepare_tty
 }
 
+pass_show_with_timeout() {
+  local key="$1"
+
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${SV_PASS_TIMEOUT_SECONDS}" pass show "$(pass_entry_path "$key")"
+    return
+  fi
+
+  pass show "$(pass_entry_path "$key")"
+}
+
 pass_failure_preposition() {
   case "$1" in
     read) printf "from" ;;
@@ -156,7 +168,7 @@ pass_failure_is_prompt_error() {
   local err="$1"
 
   case "$err" in
-    *"No pinentry"*|*"Inappropriate ioctl for device"*|*"Operation cancelled"*|*"Screen or window too small"*)
+    *"No pinentry"*|*"Inappropriate ioctl for device"*|*"Operation cancelled"*|*"Screen or window too small"*|*"timed out"*)
       return 0
       ;;
   esac
@@ -176,84 +188,45 @@ pass_failure_is_missing_key_error() {
   return 1
 }
 
-pass_private_recipient_status() {
+pass_emit_unlock_action() {
   local key="$1"
-  local secret_keyids recipient secret_keyid
+  local quoted_pwd quoted_key
 
-  [[ -n "${key}" && -f "$(pass_entry_file "${key}")" ]] || return 2
-
-  secret_keyids="$(gpg --batch --with-colons --list-secret-keys 2>/dev/null \
-    | awk -F: '$1 == "sec" || $1 == "ssb" { print $5 }')"
-  [[ -n "${secret_keyids}" ]] || return 1
-
-  while IFS= read -r recipient; do
-    [[ -n "${recipient}" ]] || continue
-
-    while IFS= read -r secret_keyid; do
-      [[ "${recipient}" == "${secret_keyid}" ]] && return 0
-    done <<< "${secret_keyids}"
-  done < <(gpg --batch --list-packets "$(pass_entry_file "${key}")" 2>/dev/null \
-    | sed -n 's/^.*keyid \([0-9A-Fa-f]*\).*$/\1/p')
-
-  if [[ -n "${recipient:-}" ]]; then
-    return 1
+  if [[ -n "${key}" ]]; then
+    printf -v quoted_key "%q" "${key}"
+    if [[ -t 0 && -t 2 ]]; then
+      printf "sv: human action: make sure this SSH terminal can show pinentry, then run:\n" >&2
+      printf "sv:   sv unlock %s\n" "${quoted_key}" >&2
+    else
+      printf -v quoted_pwd "%q" "${PWD}"
+      printf "sv: agent action: ask the human user to open an interactive SSH terminal and run:\n" >&2
+      printf "sv:   cd %s && sv unlock %s\n" "${quoted_pwd}" "${quoted_key}" >&2
+      printf "sv: then retry this command.\n" >&2
+    fi
+  else
+    printf "sv: agent action: ask the human user to run 'sv unlock <KEY>' in an interactive SSH terminal, then retry this command.\n" >&2
   fi
-
-  return 2
-}
-
-pass_failure_is_hidden_prompt_error() {
-  local action="$1" key="$2" err="$3"
-
-  [[ "${action}" == "read" && -n "${key}" ]] || return 1
-  pass_failure_is_missing_key_error "${err}" || return 1
-  pass_private_recipient_status "${key}"
-}
-
-pass_failure_is_definitely_missing_private_key() {
-  local action="$1" key="$2" err="$3"
-
-  pass_failure_is_missing_key_error "${err}" || return 1
-
-  if [[ "${action}" == "read" && -n "${key}" ]]; then
-    pass_private_recipient_status "${key}"
-    [[ "$?" -eq 1 ]]
-    return
-  fi
-
-  return 0
 }
 
 pass_emit_failure() {
   local action="$1" key="$2" err="$3"
   local subject="a secret"
-  local preposition clean_err quoted_pwd quoted_key
+  local preposition clean_err
 
   [[ -n "${key}" ]] && subject="${key}"
   preposition="$(pass_failure_preposition "${action}")"
 
-  if pass_failure_is_prompt_error "${err}" || pass_failure_is_hidden_prompt_error "${action}" "${key}" "${err}"; then
+  if pass_failure_is_prompt_error "${err}"; then
     printf "sv: failed to %s %s %s the Linux password store because gpg-agent is locked or cannot prompt/use the private key in this session.\n" "${action}" "${subject}" "${preposition}" >&2
-    if [[ -n "${key}" ]]; then
-      printf -v quoted_key "%q" "${key}"
-      if [[ -t 0 && -t 2 ]]; then
-        printf "sv: human action: make sure this SSH terminal can show pinentry, then run:\n" >&2
-        printf "sv:   sv unlock %s\n" "${quoted_key}" >&2
-      else
-        printf -v quoted_pwd "%q" "${PWD}"
-        printf "sv: agent action: ask the human user to open an interactive SSH terminal and run:\n" >&2
-        printf "sv:   cd %s && sv unlock %s\n" "${quoted_pwd}" "${quoted_key}" >&2
-        printf "sv: then retry this command.\n" >&2
-      fi
-    else
-      printf "sv: agent action: ask the human user to run 'sv unlock <KEY>' in an interactive SSH terminal, then retry this command.\n" >&2
-    fi
+    pass_emit_unlock_action "${key}"
     return
   fi
 
-  if pass_failure_is_definitely_missing_private_key "${action}" "${key}" "${err}"; then
-    printf "sv: failed to %s %s %s the Linux password store because the private GPG key is not available.\n" "${action}" "${subject}" "${preposition}" >&2
-    printf "sv: run 'sv doctor' on the Linux host to check the password-store and GPG setup.\n" >&2
+  if pass_failure_is_missing_key_error "${err}"; then
+    printf "sv: failed to %s %s %s the Linux password store because GPG says the private key is unavailable.\n" "${action}" "${subject}" "${preposition}" >&2
+    printf "sv: on Linux this can also happen when gpg-agent or pinentry cannot use the key in this session.\n" >&2
+    pass_emit_unlock_action "${key}"
+    printf "sv: if unlock fails too, run 'sv doctor' on the Linux host to check the password-store and GPG setup.\n" >&2
     return
   fi
 
@@ -301,14 +274,20 @@ pass_get() {
 
   local err_file
   err_file="$(mktemp)"
-  if pass show "$(pass_entry_path "$key")" 2>"${err_file}"; then
+  local status
+  if pass_show_with_timeout "$key" 2>"${err_file}"; then
     rm -f "${err_file}"
     return 0
+  else
+    status=$?
   fi
 
   local err
   err="$(<"${err_file}")"
   rm -f "${err_file}"
+  if [[ "${status}" -eq 124 ]]; then
+    err="${err}"$'\n'"gpg-agent or pinentry timed out while reading the secret"
+  fi
   pass_emit_failure "read" "${key}" "${err}"
   return "${SV_BACKEND_FAILURE_STATUS}"
 }
