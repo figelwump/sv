@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-readonly SV_VERSION="0.1.5"
+readonly SV_VERSION="0.1.6"
 readonly SV_REPO="figelwump/sv"
 readonly SV_RAW_URL="https://raw.githubusercontent.com/${SV_REPO}/main/sv"
 readonly SV_SERVICE_PREFIX="${SV_SERVICE_PREFIX:-sv:}"
@@ -910,7 +910,7 @@ cmd_update() {
     die "downloaded file doesn't look like a script — aborting"
   fi
 
-  chmod +x "$tmp"
+  chmod 755 "$tmp"
   mv "$tmp" "$self"
   trap - EXIT
 

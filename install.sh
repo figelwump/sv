@@ -107,7 +107,7 @@ if ! head -1 "$tmp" | grep -q '^#!/'; then
   die "downloaded file doesn't look like a script — aborting"
 fi
 
-chmod +x "$tmp"
+chmod 755 "$tmp"
 
 # Install (may need sudo)
 if [[ -w "${INSTALL_DIR}" ]]; then
