@@ -40,10 +40,15 @@ echo "sk-proj-..." | sv set OPENAI_API_KEY
 # List stored secret names (never values)
 sv ls
 
-# Run any command with secrets injected
+# Declare the project's dependencies (names only; safe to commit)
+printf 'OPENAI_API_KEY\nANTHROPIC_API_KEY?\n' > .secrets
+
+# Run with the nearest .secrets manifest
 sv exec -- npm run dev
-sv exec -- node test.js
 sv exec -- pytest
+
+# Or inject one confidently known dependency, bypassing the manifest
+sv exec --key ANTHROPIC_API_KEY -- node reviewer.mjs
 ```
 
 ## How it works
@@ -52,7 +57,7 @@ On macOS, secrets are stored in the Keychain under the service prefix `sv:`. The
 
 On Linux, secrets are stored in `pass` under the `sv/` namespace inside your password store. `sv` expects `pass init <gpg-id>` to have already been run.
 
-`sv exec -- <cmd>` resolves secrets and injects them as environment variables into the subprocess. The calling process (or agent) never sees the values.
+`sv exec -- <cmd>` resolves the nearest `.secrets` manifest and injects those secrets as environment variables into the subprocess. The calling process (or agent) never sees the values. Exact-key mode (`--key`) bypasses manifest discovery, while `--all-secrets` explicitly opts into broad vault access.
 
 ## Linux / Raspberry Pi setup
 
@@ -103,16 +108,40 @@ ANTHROPIC_API_KEY?
 - If a manifest has only optional entries and none are available, `sv exec` runs the command without requiring the backend to be initialized; `--strict` restores required-secret behavior.
 - Use `sv exec --strict -- <cmd>` to treat optional secrets as required for one command.
 - `sv doctor` reports required and optional manifest status separately when backend checks pass.
-- When absent, all stored secrets are injected.
+- When absent, ordinary `sv exec` fails before starting the child. Create a manifest, use repeatable `--key <KEY>` for confidently known dependencies, or explicitly request legacy broad behavior with `--all-secrets`.
 - The manifest is found by searching up from the current directory, so running from a subdirectory works.
+- An empty or comments-only manifest is valid and runs the child without injected secrets.
+
+## Execution modes
+
+`sv exec` has three mutually exclusive selection modes. The `--` separator before the child command is required.
+
+```bash
+# Normal project workflow: nearest .secrets manifest
+sv exec -- npm test
+
+# Exact dependencies: bypass the manifest and inject only these names
+sv exec --key ANTHROPIC_API_KEY -- node reviewer.mjs
+sv exec --key API_KEY --key DATABASE_URL -- ./integration-test.sh
+
+# Explicit legacy behavior: ignore any manifest and inject the complete vault
+sv exec --all-secrets -- legacy-command
+```
+
+`--strict` is manifest-only and treats optional `KEY?` entries as required. It cannot be combined with `--key` or `--all-secrets`. Duplicate `--key` names and invalid environment-variable names are rejected.
 
 ## Agent usage
 
-Agents prefix commands with `sv exec --` to run with secrets. They never see the actual values:
+Agents normally use manifest-scoped `sv exec` and do not guess transitive dependencies. They never see the actual values:
 
 ```bash
 sv exec -- npm test
-sv exec -- node scripts/call-api.js
+```
+
+For a confidently known dependency, make the name visible without exposing its value:
+
+```bash
+sv exec --key ANTHROPIC_API_KEY -- node scripts/reviewer.mjs
 ```
 
 On Linux, this assumes `gpg-agent` is already unlocked in the current session. If it is not, `sv exec` may fail in non-interactive SSH contexts before the target command starts. In that case, the agent should ask the human user to run the unlock step in an interactive SSH terminal:
@@ -135,6 +164,10 @@ Add to your project's `AGENTS.md`:
 ## Secrets
 
 Use `sv exec -- <command>` to run commands that need API keys or secrets.
+Normal execution is scoped by the nearest committed `.secrets` manifest. Do not
+guess transitive dependencies. When a dependency is confidently known, use
+`sv exec --key <KEY> -- <command>`. Use `--all-secrets` only with explicit user
+intent to expose the complete vault to the child process.
 Never ask for or hardcode secret values. The `sv` tool injects them automatically.
 Do NOT use `sv get`, `printenv`, `env`, `security find-generic-password`, or
 `pass show` to read secret values. These commands exist for human use only.
@@ -146,6 +179,11 @@ Do NOT use `sv get`, `printenv`, `env`, `security find-generic-password`, or
 - **`sv get`** is gated behind a TTY check — it refuses to print values when stdout is piped or captured. This blocks agents (which capture command output) from reading secrets through `sv get`.
 - **Linux `sv exec`** depends on `gpg-agent` state. If the agent is locked, non-interactive processes cannot satisfy the passphrase prompt.
 - **`.secrets` manifests** declare requirements by name only and are safe to commit. They scope injection so projects only get the secrets they need.
+- **Exact-key execution** exposes selected names in argv for review while values remain in the child environment. `--key` accepts names, never values.
+- **Process-control environment names are rejected.** Secret selection cannot replace loader, shell-startup, or executable-search variables such as `LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, `BASH_ENV`, or `PATH`.
+- **Broad execution is explicit.** `--all-secrets` is the only mode that injects the complete vault and ignores a discovered manifest.
+- **Backend failures remain distinct from missing keys.** An inaccessible Keychain or password store fails before child execution instead of being reported as an absent credential or empty vault.
+- **Exit status `2` identifies backend access failures.** Missing requested keys and invalid usage remain ordinary nonzero failures; callers can distinguish an inaccessible vault without inspecting secret values.
 
 These are practical barriers, not a hard sandbox. An agent with shell access could still extract secrets through other means. The real enforcement is agent instructions.
 
@@ -172,9 +210,21 @@ make test-purge          # purge macOS test secrets
 | `sv get <KEY>` | Print a secret value (TTY only) |
 | `sv rm <KEY>` | Delete a secret |
 | `sv ls` | List secret names |
-| `sv exec [--strict] -- <cmd>` | Run command with secrets injected |
+| `sv exec [--strict] -- <cmd>` | Run with the nearest `.secrets` manifest |
+| `sv exec --key <KEY> [--key <KEY>...] -- <cmd>` | Run with exactly the named required secrets |
+| `sv exec --all-secrets -- <cmd>` | Explicitly run with every stored secret |
 | `sv unlock <KEY>` | Unlock Linux GPG agent without printing a secret |
 | `sv doctor` | Check backend setup and common failures |
 | `sv update` | Update to latest version |
 | `sv version` | Print version |
 | `sv help` | Show help |
+
+## Migrating from 0.1.x
+
+Version 0.2.0 removes the implicit all-vault fallback and requires `--` before the child command.
+
+- Add a committed `.secrets` manifest for ordinary project commands.
+- Replace known one-off dependencies with `--key <KEY>`.
+- Replace intentional legacy all-vault execution with `--all-secrets`.
+- Change `sv exec command` to `sv exec -- command`.
+- Treat Keychain/password-store access errors as backend failures; do not assume reported credentials are absent without checking `sv doctor` in an authorized session.

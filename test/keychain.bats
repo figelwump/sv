@@ -99,3 +99,123 @@ teardown() {
   result="$(test_kc_get SPECIAL_KEY)"
   [ "$result" = 'p@$$w0rd!&"quotes' ]
 }
+
+@test "sv exec distinguishes inaccessible Keychain from a missing manifest key" {
+  local root fakebin project
+  root="$(mktemp -d)"
+  fakebin="${root}/bin"
+  project="${root}/project"
+  mkdir -p "${fakebin}" "${project}"
+  cat > "${fakebin}/security" <<'EOF'
+#!/usr/bin/env bash
+printf 'security: SecKeychainSearchCopyNext: User interaction is not allowed.\n' >&2
+exit 1
+EOF
+  chmod +x "${fakebin}/security"
+  echo "REQUIRED_KEY" > "${project}/.secrets"
+
+  run bash -c "cd '$project' && PATH='$fakebin':\$PATH '$SV_BIN' exec -- echo should_not_run"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"Keychain may be inaccessible in this session"* ]]
+  [[ "$output" != *"missing required secrets"* ]]
+  rm -rf "${root}"
+}
+
+@test "sv exec distinguishes inaccessible Keychain enumeration from an empty vault" {
+  local root fakebin project
+  root="$(mktemp -d)"
+  fakebin="${root}/bin"
+  project="${root}/project"
+  mkdir -p "${fakebin}" "${project}"
+  cat > "${fakebin}/security" <<'EOF'
+#!/usr/bin/env bash
+printf 'security: SecKeychainCopyDefault: A required entitlement is missing.\n' >&2
+exit 1
+EOF
+  chmod +x "${fakebin}/security"
+
+  run bash -c "cd '$project' && PATH='$fakebin':\$PATH '$SV_BIN' exec --all-secrets -- echo should_not_run"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"Keychain may be inaccessible in this session"* ]]
+  rm -rf "${root}"
+}
+
+@test "sv exec propagates Keychain failure while reading a resolved key" {
+  local root fakebin project
+  root="$(mktemp -d)"
+  fakebin="${root}/bin"
+  project="${root}/project"
+  mkdir -p "${fakebin}" "${project}"
+  cat > "${fakebin}/security" <<'EOF'
+#!/usr/bin/env bash
+case " $* " in
+  *" -w "*)
+    printf 'security: SecKeychainSearchCopyNext: User interaction is not allowed.\n' >&2
+    exit 1
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+EOF
+  chmod +x "${fakebin}/security"
+
+  run bash -c "cd '$project' && PATH='$fakebin':\$PATH '$SV_BIN' exec --key RESOLVED_KEY -- echo should_not_run"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"Keychain may be inaccessible in this session"* ]]
+  [[ "$output" != *"failed to resolve secret"* ]]
+  rm -rf "${root}"
+}
+
+@test "sv ls handles a literal service prefix with regex and path characters" {
+  local prefix='sv_test.literal.[x]/*:'
+  security add-generic-password -a "${USER}" -s "${prefix}BRAVO" -w "b" -U >/dev/null 2>&1
+  security add-generic-password -a "${USER}" -s "${prefix}ALPHA" -w "a" -U >/dev/null 2>&1
+
+  run env SV_SERVICE_PREFIX="${prefix}" "$SV_BIN" ls
+  [ "$status" -eq 0 ]
+  [ "$output" = $'ALPHA\nBRAVO' ]
+
+  security delete-generic-password -a "${USER}" -s "${prefix}ALPHA" >/dev/null 2>&1 || true
+  security delete-generic-password -a "${USER}" -s "${prefix}BRAVO" >/dev/null 2>&1 || true
+}
+
+@test "sv exec accepts the C-locale missing-item message fallback" {
+  local root fakebin project
+  root="$(mktemp -d)"
+  fakebin="${root}/bin"
+  project="${root}/project"
+  mkdir -p "${fakebin}" "${project}"
+  cat > "${fakebin}/security" <<'EOF'
+#!/usr/bin/env bash
+printf 'security: The specified item could not be found in the keychain.\n' >&2
+exit 1
+EOF
+  chmod +x "${fakebin}/security"
+
+  run bash -c "cd '$project' && PATH='$fakebin':\$PATH '$SV_BIN' exec --key ABSENT_KEY -- echo should_not_run"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"missing requested secrets: ABSENT_KEY"* ]]
+  [[ "$output" != *"Keychain may be inaccessible"* ]]
+  rm -rf "${root}"
+}
+
+@test "optional-only manifest runs when Keychain access is unavailable" {
+  local root fakebin project
+  root="$(mktemp -d)"
+  fakebin="${root}/bin"
+  project="${root}/project"
+  mkdir -p "${fakebin}" "${project}"
+  cat > "${fakebin}/security" <<'EOF'
+#!/usr/bin/env bash
+printf 'security: User interaction is not allowed.\n' >&2
+exit 1
+EOF
+  chmod +x "${fakebin}/security"
+  echo "OPTIONAL_KEY?" > "${project}/.secrets"
+
+  run bash -c "cd '$project' && PATH='$fakebin':\$PATH '$SV_BIN' exec -- echo optional_backend_unavailable_ok"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"optional_backend_unavailable_ok"* ]]
+  rm -rf "${root}"
+}

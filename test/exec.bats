@@ -51,12 +51,12 @@ teardown() {
   [ "$output" = "hello world" ]
 }
 
-@test "sv exec works without -- separator" {
+@test "sv exec requires -- separator" {
   test_store_set DUMMY "val"
   echo "DUMMY" > "$TEST_TMPDIR/.secrets"
   run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec echo hello"
-  [ "$status" -eq 0 ]
-  [ "$output" = "hello" ]
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"requires '--'"* ]]
 }
 
 @test "sv exec with no secrets just runs the command" {
@@ -97,4 +97,119 @@ teardown() {
   run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec -- printenv SECRET_PS"
   [ "$status" -eq 0 ]
   [ "$output" = "hidden_value" ]
+}
+
+@test "sv exec does not invoke env with secret assignments in argv" {
+  local fakebin marker
+  fakebin="${TEST_TMPDIR}/bin"
+  marker="${TEST_TMPDIR}/env-invoked"
+  mkdir -p "${fakebin}"
+  cat > "${fakebin}/env" <<EOF
+#!/usr/bin/env bash
+touch '${marker}'
+exit 99
+EOF
+  chmod +x "${fakebin}/env"
+  test_store_set SECRET_ARGV "must_not_reach_argv"
+  echo "SECRET_ARGV" > "$TEST_TMPDIR/.secrets"
+
+  run bash -c "cd '$TEST_TMPDIR' && PATH='$fakebin':\$PATH '$SV_BIN' exec -- /bin/sh -c 'test \"\$SECRET_ARGV\" = must_not_reach_argv'"
+  [ "$status" -eq 0 ]
+  [ ! -e "${marker}" ]
+}
+
+@test "sv exec --key injects exactly one requested key" {
+  test_store_set EXACT_KEY "exact_val"
+  test_store_set MANIFEST_KEY "manifest_val"
+  test_store_set UNRELATED_KEY "unrelated_val"
+  echo "MANIFEST_KEY" > "$TEST_TMPDIR/.secrets"
+
+  run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec --key EXACT_KEY -- bash -c 'printf \"%s:%s:%s\" \"\$EXACT_KEY\" \"\${MANIFEST_KEY-unset}\" \"\${UNRELATED_KEY-unset}\"'"
+  [ "$status" -eq 0 ]
+  [ "$output" = "exact_val:unset:unset" ]
+}
+
+@test "sv exec --key is repeatable" {
+  test_store_set KEY_ONE "one"
+  test_store_set KEY_TWO "two"
+  echo "" > "$TEST_TMPDIR/.secrets"
+
+  run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec --key KEY_ONE --key KEY_TWO -- bash -c 'printf \"%s:%s\" \"\$KEY_ONE\" \"\$KEY_TWO\"'"
+  [ "$status" -eq 0 ]
+  [ "$output" = "one:two" ]
+}
+
+@test "sv exec --key fails when a requested key is missing" {
+  echo "" > "$TEST_TMPDIR/.secrets"
+  run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec --key DOES_NOT_EXIST -- echo should_not_run"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"missing requested secrets: DOES_NOT_EXIST"* ]]
+}
+
+@test "sv exec --key rejects invalid and optional-style names" {
+  echo "" > "$TEST_TMPDIR/.secrets"
+
+  run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec --key 'BAD-KEY' -- echo should_not_run"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"invalid key"* ]]
+
+  run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec --key 'OPTIONAL_KEY?' -- echo should_not_run"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"invalid key"* ]]
+
+  run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec --key LD_PRELOAD -- echo should_not_run"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"process-control environment variables"* ]]
+}
+
+@test "sv exec --key rejects duplicate keys" {
+  test_store_set DUPLICATE_KEY "value"
+  echo "" > "$TEST_TMPDIR/.secrets"
+  run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec --key DUPLICATE_KEY --key DUPLICATE_KEY -- echo should_not_run"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"duplicate requested key"* ]]
+}
+
+@test "sv exec --key requires a separate key argument" {
+  echo "" > "$TEST_TMPDIR/.secrets"
+
+  run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec --key -- echo should_not_run"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"--key requires a key name"* ]]
+
+  run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec --key=EXACT_KEY -- echo should_not_run"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"use '--key <KEY>'"* ]]
+
+  run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec --key"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"--key requires a key name"* ]]
+}
+
+@test "sv exec rejects incompatible selection modes" {
+  test_store_set MODE_KEY "value"
+  echo "MODE_KEY?" > "$TEST_TMPDIR/.secrets"
+
+  run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec --key MODE_KEY --all-secrets -- echo should_not_run"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"mutually exclusive"* || "$output" == *"cannot be combined"* ]]
+
+  run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec --strict --key MODE_KEY -- echo should_not_run"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"--strict can only be used"* ]]
+
+  run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec --all-secrets --strict -- echo should_not_run"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"--strict can only be used"* ]]
+
+  run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec --all-secrets --all-secrets -- echo should_not_run"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"cannot be combined"* ]]
+}
+
+@test "sv exec flags after -- are child arguments" {
+  echo "" > "$TEST_TMPDIR/.secrets"
+  run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec -- bash -c 'printf \"%s:%s\" \"\$1\" \"\$2\"' child --key --all-secrets"
+  [ "$status" -eq 0 ]
+  [ "$output" = "--key:--all-secrets" ]
 }

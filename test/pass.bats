@@ -102,13 +102,35 @@ teardown() {
   rm -rf "$empty_store"
 }
 
-@test "sv exec without a manifest still runs when password-store is uninitialized" {
+@test "sv exec without a manifest fails before checking password-store" {
   local empty_store
   empty_store="$(mktemp -d)"
 
   run bash -c "export PASSWORD_STORE_DIR='$empty_store' GNUPGHOME='$GNUPGHOME'; '$SV_BIN' exec -- echo pass_through"
-  [ "$status" -eq 0 ]
-  [ "$output" = "pass_through" ]
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"no .secrets manifest found"* ]]
+
+  rm -rf "$empty_store"
+}
+
+@test "sv exec --all-secrets requires an initialized password-store" {
+  local empty_store
+  empty_store="$(mktemp -d)"
+
+  run bash -c "export PASSWORD_STORE_DIR='$empty_store' GNUPGHOME='$GNUPGHOME'; '$SV_BIN' exec --all-secrets -- echo should_not_run"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"password store is not initialized"* ]]
+
+  rm -rf "$empty_store"
+}
+
+@test "sv exec --key requires an initialized password-store" {
+  local empty_store
+  empty_store="$(mktemp -d)"
+
+  run bash -c "export PASSWORD_STORE_DIR='$empty_store' GNUPGHOME='$GNUPGHOME'; '$SV_BIN' exec --key MY_KEY -- echo should_not_run"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"password store is not initialized"* ]]
 
   rm -rf "$empty_store"
 }
@@ -175,8 +197,8 @@ teardown() {
   manifest_dir="${root}/project"
   mkdir -p "${fakebin}" "${store_dir}/sv" "${manifest_dir}"
   echo "${TEST_GPG_ID}" > "${store_dir}/.gpg-id"
-  : > "${store_dir}/sv/LOCKED_KEY;PWNED.gpg"
-  echo "LOCKED_KEY;PWNED" > "${manifest_dir}/.secrets"
+  : > "${store_dir}/sv/LOCKED_KEY.gpg"
+  echo "LOCKED_KEY" > "${manifest_dir}/.secrets"
 
   cat > "${fakebin}/pass" <<'EOF'
 #!/usr/bin/env bash
@@ -191,12 +213,11 @@ EOF
 
   run bash -c "cd '$manifest_dir' && export PATH='$fakebin':\$PATH PASSWORD_STORE_DIR='$store_dir' GNUPGHOME='$GNUPGHOME'; FAKE_PASS_ERROR=\$'gpg: public key decryption failed: Inappropriate ioctl for device\ngpg: decryption failed: No secret key' '$SV_BIN' exec -- echo should_not_run"
   [ "$status" -ne 0 ]
-  [[ "$output" == *"failed to read LOCKED_KEY;PWNED"* ]]
+  [[ "$output" == *"failed to read LOCKED_KEY"* ]]
   [[ "$output" == *"gpg-agent is locked or cannot prompt"* ]]
   [[ "$output" == *"ask the human user"* ]]
   [[ "$output" != *"private GPG key is not available"* ]]
-  printf "%s" "$output" | grep -F "sv unlock LOCKED_KEY\\;PWNED" >/dev/null
-  [[ "$output" != *"sv unlock LOCKED_KEY;PWNED"* ]]
+  [[ "$output" == *"sv unlock LOCKED_KEY"* ]]
   [[ "$output" != *"failed to resolve secret"* ]]
 
   rm -rf "$root"
@@ -270,7 +291,7 @@ EOF
   chmod +x "${fakebin}/pass"
 
   run bash -c "cd '$manifest_dir' && export PATH='$fakebin':\$PATH PASSWORD_STORE_DIR='$store_dir' GNUPGHOME='$GNUPGHOME' SV_PASS_TIMEOUT_SECONDS=1; '$SV_BIN' exec -- echo should_not_run"
-  [ "$status" -ne 0 ]
+  [ "$status" -eq 2 ]
   [[ "$output" == *"timed out while reading the secret"* ]]
   [[ "$output" == *"gpg-agent is locked or cannot prompt"* ]]
   [[ "$output" == *"ask the human user"* ]]
@@ -359,9 +380,8 @@ EOF
   [ "$status" -ne 0 ]
   [[ "$output" == *"password store not initialized"* ]]
   [[ "$output" == *"Next steps:"* ]]
-  [[ "$output" == *"gpg --full-generate-key"* ]]
-  [[ "$output" == *"gpg --list-secret-keys --keyid-format=long"* ]]
-  [[ "$output" == *"pass init <gpg-id>"* ]]
+  [[ "$output" == *"pass init ${TEST_GPG_ID}"* ]]
+  [[ "$output" != *"gpg --full-generate-key"* ]]
 
   rm -rf "$empty_store"
 }

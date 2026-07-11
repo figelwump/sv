@@ -11,7 +11,9 @@
 #   sv rm <KEY>                Delete a secret
 #   sv ls                      List secret names (never values)
 #   sv exec [--strict] -- <cmd> [args]
-#                               Run a command with secrets as env vars
+#   sv exec --key <KEY> [--key <KEY>...] -- <cmd> [args]
+#   sv exec --all-secrets -- <cmd> [args]
+#                               Run a command with selected secrets as env vars
 #   sv unlock <KEY>            Unlock Linux GPG agent without printing a secret
 #   sv doctor                  Check backend setup and common failures
 #   sv update                  Update sv to the latest version
@@ -21,7 +23,7 @@
 
 set -euo pipefail
 
-readonly SV_VERSION="0.1.6"
+readonly SV_VERSION="0.2.0"
 readonly SV_REPO="figelwump/sv"
 readonly SV_RAW_URL="https://raw.githubusercontent.com/${SV_REPO}/main/sv"
 readonly SV_SERVICE_PREFIX="${SV_SERVICE_PREFIX:-sv:}"
@@ -73,21 +75,78 @@ kc_set() {
     -U 2>/dev/null
 }
 
+# Return success only for a genuine Keychain item-not-found error.
+kc_failure_is_not_found() {
+  local status="$1" err="$2"
+  # macOS reports errSecItemNotFound as exit 44. Keep the C-locale message
+  # fallback for older security variants that do not preserve that status.
+  [[ "${status}" -eq 44 || "${err}" == *"could not be found"* ]]
+}
+
+kc_emit_access_failure() {
+  local action="$1" key="${2:-}" err="${3:-}"
+  local subject="the sv Keychain" clean_err
+
+  [[ -n "${key}" ]] && subject="${key} in the sv Keychain"
+  clean_err="${err//$'\n'/ }"
+
+  if [[ -n "${clean_err}" ]]; then
+    printf "sv: failed to %s %s: %s\n" "${action}" "${subject}" "${clean_err}" >&2
+  else
+    printf "sv: failed to %s %s.\n" "${action}" "${subject}" >&2
+  fi
+  printf "sv: macOS Keychain may be inaccessible in this session; if running in a sandbox, retry with authorized Keychain access.\n" >&2
+}
+
 # Retrieve a secret from the Keychain.
-# Returns 1 if not found.
+# Returns 1 if not found and 2 if the backend is inaccessible.
 kc_get() {
   local key="$1"
-  security find-generic-password \
+  local err_file err status
+  err_file="$(mktemp)"
+
+  if LC_ALL=C security find-generic-password \
     -a "${SV_KEYCHAIN_ACCOUNT}" \
     -s "${SV_SERVICE_PREFIX}${key}" \
-    -w 2>/dev/null
+    -w 2>"${err_file}"; then
+    rm -f "${err_file}"
+    return 0
+  else
+    status=$?
+  fi
+
+  err="$(<"${err_file}")"
+  rm -f "${err_file}"
+  if kc_failure_is_not_found "${status}" "${err}"; then
+    return 1
+  fi
+
+  kc_emit_access_failure "read" "${key}" "${err}"
+  return "${SV_BACKEND_FAILURE_STATUS}"
 }
 
 kc_has() {
   local key="$1"
-  security find-generic-password \
+  local err_file err status
+  err_file="$(mktemp)"
+
+  if LC_ALL=C security find-generic-password \
     -a "${SV_KEYCHAIN_ACCOUNT}" \
-    -s "${SV_SERVICE_PREFIX}${key}" >/dev/null 2>&1
+    -s "${SV_SERVICE_PREFIX}${key}" >/dev/null 2>"${err_file}"; then
+    rm -f "${err_file}"
+    return 0
+  else
+    status=$?
+  fi
+
+  err="$(<"${err_file}")"
+  rm -f "${err_file}"
+  if kc_failure_is_not_found "${status}" "${err}"; then
+    return 1
+  fi
+
+  kc_emit_access_failure "look up" "${key}" "${err}"
+  return "${SV_BACKEND_FAILURE_STATUS}"
 }
 
 # Delete a secret from the Keychain.
@@ -101,11 +160,44 @@ kc_rm() {
 # List all sv secret names from the Keychain.
 # Parses `security dump-keychain` output for our service prefix.
 kc_ls() {
-  security dump-keychain 2>/dev/null \
-    | grep "\"svce\"<blob>=\"${SV_SERVICE_PREFIX}" \
-    | sed "s/.*\"${SV_SERVICE_PREFIX}\(.*\)\"/\1/" \
-    | sort -u \
-    || true
+  local dump_file err_file err output line service
+  dump_file="$(mktemp)"
+  err_file="$(mktemp)"
+
+  if ! LC_ALL=C security dump-keychain >"${dump_file}" 2>"${err_file}"; then
+    err="$(<"${err_file}")"
+    rm -f "${dump_file}" "${err_file}"
+    kc_emit_access_failure "list" "" "${err}"
+    return "${SV_BACKEND_FAILURE_STATUS}"
+  fi
+
+  if output="$({
+    while IFS= read -r line; do
+      case "${line}" in
+        *'"svce"<blob>="'*)
+          service="${line#*'"svce"<blob>="'}"
+          service="${service%%\"*}"
+          case "${service}" in
+            "${SV_SERVICE_PREFIX}"*)
+              printf "%s\n" "${service#"${SV_SERVICE_PREFIX}"}"
+              ;;
+          esac
+          ;;
+      esac
+    done < "${dump_file}"
+    : # An empty listing is successful; keep pipefail focused on real parser/sort errors.
+  } | sort -u)"; then
+    :
+  else
+    rm -f "${dump_file}" "${err_file}"
+    kc_emit_access_failure "parse the listing from" "" ""
+    return "${SV_BACKEND_FAILURE_STATUS}"
+  fi
+  rm -f "${dump_file}" "${err_file}"
+  if [[ -n "${output}" ]]; then
+    printf "%s\n" "${output}"
+  fi
+  return 0
 }
 
 # ─── Linux password-store operations ──────────────────────────────────────────
@@ -231,6 +323,9 @@ pass_emit_failure() {
 
   if pass_failure_is_prompt_error "${err}"; then
     printf "sv: failed to %s %s %s the Linux password store because gpg-agent is locked or cannot prompt/use the private key in this session.\n" "${action}" "${subject}" "${preposition}" >&2
+    if [[ "${err}" == *"timed out while reading the secret"* ]]; then
+      printf "sv: gpg-agent or pinentry timed out while reading the secret.\n" >&2
+    fi
     pass_emit_unlock_action "${key}"
     return
   fi
@@ -694,24 +789,46 @@ manifest_entry_is_optional() {
   [[ "$1" == *\? ]]
 }
 
+validate_key_name() {
+  local key="$1"
+  if [[ ! "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    die "invalid key '${key}' — must be a valid env var name (letters, digits, underscores)"
+  fi
+}
+
+validate_injectable_key_name() {
+  local key="$1"
+  validate_key_name "${key}"
+  case "${key}" in
+    PATH|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|LD_PRELOAD|LD_LIBRARY_PATH|DYLD_INSERT_LIBRARIES|DYLD_LIBRARY_PATH|DYLD_FRAMEWORK_PATH)
+      die "unsafe key '${key}' — process-control environment variables cannot be injected"
+      ;;
+  esac
+}
+
 # ─── Resolve which secrets to inject ──────────────────────────────────────────
 
-# If a .secrets manifest is found (searching up from cwd), use it to scope.
-# Otherwise, inject all sv secrets.
-# Fails if a required manifest key is not found in the active backend.
+# Resolve the exact set of secret names for one execution mode.
+# Modes are manifest (default), keys (explicit names), and all (entire store).
 resolve_secret_names() {
-  local strict="${1:-0}"
-  local manifest_path
-  manifest_path="$(find_manifest)"
+  local mode="$1" strict="$2"
+  shift 2
 
-  if [[ -n "${manifest_path}" ]]; then
+  if [[ "${mode}" == "manifest" ]]; then
+    local manifest_path
+    manifest_path="$(find_manifest)"
+    if [[ -z "${manifest_path}" ]]; then
+      die "no .secrets manifest found; create one, use --key <KEY>, or explicitly use --all-secrets"
+    fi
+
     local manifest_entries
     manifest_entries="$(read_manifest "${manifest_path}")"
     if [[ -z "${manifest_entries}" ]]; then
       return
     fi
 
-    local entry key has_required=0
+    local entry key status seen_key has_required=0
+    local seen_keys=()
     while IFS= read -r entry; do
       if [[ "${strict}" -eq 1 ]] || ! manifest_entry_is_optional "${entry}"; then
         has_required=1
@@ -727,9 +844,22 @@ resolve_secret_names() {
     local resolved=()
     while IFS= read -r entry; do
       key="$(manifest_entry_key "${entry}")"
+      validate_injectable_key_name "${key}"
+      for seen_key in "${seen_keys[@]:-}"; do
+        [[ "${seen_key}" != "${key}" ]] || die "duplicate manifest key: ${key}"
+      done
+      seen_keys+=("${key}")
       if store_has "${key}"; then
         resolved+=("${key}")
         continue
+      else
+        status=$?
+        if [[ "${status}" -eq "${SV_BACKEND_FAILURE_STATUS}" ]]; then
+          if [[ "${strict}" -eq 0 ]] && manifest_entry_is_optional "${entry}"; then
+            continue
+          fi
+          return "${status}"
+        fi
       fi
 
       if [[ "${strict}" -eq 1 ]] || ! manifest_entry_is_optional "${entry}"; then
@@ -744,9 +874,39 @@ resolve_secret_names() {
     if [[ ${#resolved[@]} -gt 0 ]]; then
       printf "%s\n" "${resolved[@]}"
     fi
-  else
-    store_ls
+    return
   fi
+
+  if [[ "${mode}" == "keys" ]]; then
+    store_require_ready
+    local key status
+    local missing=()
+    for key in "$@"; do
+      if store_has "${key}"; then
+        continue
+      else
+        status=$?
+        [[ "${status}" -eq "${SV_BACKEND_FAILURE_STATUS}" ]] && return "${status}"
+      fi
+      missing+=("${key}")
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+      die "missing requested secrets: ${missing[*]}"
+    fi
+    printf "%s\n" "$@"
+    return
+  fi
+
+  store_require_ready
+  local all_names
+  if all_names="$(store_ls)"; then
+    if [[ -n "${all_names}" ]]; then
+      printf "%s\n" "${all_names}"
+    fi
+    return 0
+  fi
+  return "${SV_BACKEND_FAILURE_STATUS}"
 }
 
 # ─── Commands ─────────────────────────────────────────────────────────────────
@@ -761,10 +921,7 @@ cmd_set() {
     die "do not pass the value as an argument (it leaks into shell history). Use: sv set ${key}"
   fi
 
-  # Validate key looks like an env var name
-  if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-    die "invalid key '${key}' — must be a valid env var name (letters, digits, underscores)"
-  fi
+  validate_key_name "${key}"
 
   local value
   if [[ ! -t 0 ]]; then
@@ -800,7 +957,7 @@ cmd_get() {
     return 0
   else
     local status=$?
-    [[ "${status}" -eq "${SV_BACKEND_FAILURE_STATUS}" ]] && return 1
+    [[ "${status}" -eq "${SV_BACKEND_FAILURE_STATUS}" ]] && return "${status}"
 
     die "secret not found: $key"
   fi
@@ -832,7 +989,7 @@ cmd_unlock() {
     return 0
   else
     local status=$?
-    [[ "${status}" -eq "${SV_BACKEND_FAILURE_STATUS}" ]] && return 1
+    [[ "${status}" -eq "${SV_BACKEND_FAILURE_STATUS}" ]] && return "${status}"
 
     die "secret not found: $key"
   fi
@@ -848,7 +1005,12 @@ cmd_rm() {
 
 cmd_ls() {
   local keys
-  keys="$(store_ls)"
+  store_require_ready
+  if keys="$(store_ls)"; then
+    :
+  else
+    return $?
+  fi
   if [[ -z "$keys" ]]; then
     printf "sv: no secrets stored\n" >&2
     return
@@ -857,35 +1019,99 @@ cmd_ls() {
 }
 
 cmd_exec() {
-  local strict="$1"
-  shift
+  local mode="manifest" strict=0 saw_separator=0
+  local -a explicit_keys=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --)
+        saw_separator=1
+        shift
+        break
+        ;;
+      --strict)
+        [[ "${strict}" -eq 0 ]] || die "duplicate exec option: --strict"
+        strict=1
+        shift
+        ;;
+      --key)
+        [[ $# -ge 2 && "$2" != "--" ]] || die "--key requires a key name"
+        [[ "${mode}" != "all" ]] || die "--key and --all-secrets are mutually exclusive"
+        mode="keys"
+        validate_injectable_key_name "$2"
+        local existing
+        for existing in "${explicit_keys[@]:-}"; do
+          [[ "${existing}" != "$2" ]] || die "duplicate requested key: $2"
+        done
+        explicit_keys+=("$2")
+        shift 2
+        ;;
+      --key=*)
+        die "use '--key <KEY>', not '--key=<KEY>'"
+        ;;
+      --all-secrets)
+        [[ "${mode}" == "manifest" ]] || die "--all-secrets cannot be combined with --key or repeated"
+        mode="all"
+        shift
+        ;;
+      --*)
+        die "unknown sv exec option: $1"
+        ;;
+      *)
+        die "sv exec requires '--' before the command"
+        ;;
+    esac
+  done
+
+  [[ "${saw_separator}" -eq 1 && $# -gt 0 ]] || die "usage: sv exec [--strict | --key <KEY>... | --all-secrets] -- <command> [args...]"
+  [[ "${mode}" == "manifest" || "${strict}" -eq 0 ]] || die "--strict can only be used with manifest-scoped execution"
 
   # Collect env vars
   local names
-  names="$(resolve_secret_names "${strict}")"
+  if [[ "${mode}" == "keys" ]]; then
+    if names="$(resolve_secret_names "${mode}" "${strict}" "${explicit_keys[@]}")"; then
+      :
+    else
+      return $?
+    fi
+  elif names="$(resolve_secret_names "${mode}" "${strict}")"; then
+    :
+  else
+    return $?
+  fi
 
   if [[ -z "$names" ]]; then
     # No secrets to inject, just run the command
     exec "$@"
   fi
 
-  # Build env assignments
-  local env_args=()
+  # Resolve every value before changing this shell's environment. This prevents
+  # an injected process-control variable from affecting backend reads.
+  local env_names=()
+  local env_values=()
   while IFS= read -r key; do
+    validate_injectable_key_name "${key}"
     local value
     if value="$(store_get "$key")"; then
-      env_args+=("${key}=${value}")
+      env_names+=("${key}")
+      env_values+=("${value}")
       continue
     else
       local status=$?
-      [[ "${status}" -eq "${SV_BACKEND_FAILURE_STATUS}" ]] && return 1
+      [[ "${status}" -eq "${SV_BACKEND_FAILURE_STATUS}" ]] && return "${status}"
 
       die "failed to resolve secret: $key"
     fi
   done <<< "$names"
 
-  # Use env to inject and exec the command
-  exec env "${env_args[@]}" "$@"
+  # export is a shell builtin, so values never become argv of an intermediate
+  # `env` process. Only the directly exec'd child inherits them.
+  local index
+  for ((index = 0; index < ${#env_names[@]}; index++)); do
+    export "${env_names[index]}=${env_values[index]}"
+  done
+  unset value env_values
+  exec "$@"
 }
 
 cmd_update() {
@@ -934,7 +1160,11 @@ Usage:
   sv rm <KEY>                Delete a secret
   sv ls                      List secret names (never values)
   sv exec [--strict] -- <cmd> [args]
-                             Run a command with secrets as env vars
+                             Run with secrets from the nearest .secrets manifest
+  sv exec --key <KEY> [--key <KEY>...] -- <cmd> [args]
+                             Run with exactly the named required secrets
+  sv exec --all-secrets -- <cmd> [args]
+                             Run with every stored secret (explicit legacy mode)
   sv unlock <KEY>            Unlock Linux GPG agent without printing a secret
   sv doctor                  Check backend setup and common failures
   sv update                  Update sv to the latest version
@@ -949,27 +1179,32 @@ Project manifests:
     DATABASE_URL
     ANTHROPIC_API_KEY?
 
-  When present, sv exec only injects listed secrets and fails if any
-  required secrets are missing from the active backend. Optional entries
+  Normal sv exec requires a discovered manifest, injects only listed secrets,
+  and fails if any required secrets are missing from the active backend.
+  Optional entries
   use a trailing ? and are skipped when missing. Use sv exec --strict --
-  to treat optional entries as required. When absent, all stored secrets are injected.
+  to treat optional entries as required. An empty manifest injects nothing.
 
   The manifest is found by searching up from the current directory.
+  Use repeatable --key for a known exact dependency that should bypass the
+  project manifest. Use --all-secrets only when broad vault access is intended.
 
 Examples:
   sv set OPENAI_API_KEY                   # prompts for value
   echo "sk-..." | sv set OPENAI_API_KEY   # pipe from stdin
   sv ls                                   # shows: OPENAI_API_KEY
   sv exec -- npm run dev                  # runs with secrets injected
-  sv exec -- node test.js                 # same
+  sv exec --key ANTHROPIC_API_KEY -- node reviewer.mjs
+  sv exec --all-secrets -- legacy-command
   sv unlock OPENAI_API_KEY                # Linux: warm gpg-agent interactively
 
 Agent usage:
-  Agents should prefix commands with sv exec -- to get secrets without
-  ever seeing the actual values:
+  Agents normally use manifest-scoped sv exec and must not guess transitive
+  dependencies. For a confidently known dependency, use --key so the name is
+  explicit without exposing the value:
 
     sv exec -- npm test
-    sv exec -- node scripts/call-api.js
+    sv exec --key ANTHROPIC_API_KEY -- node scripts/reviewer.mjs
 
 Backends:
   macOS uses the Keychain via `security`.
@@ -989,17 +1224,7 @@ case "$cmd" in
   rm|remove)  cmd_rm "$@" ;;
   ls|list)    cmd_ls ;;
   doctor)     cmd_doctor ;;
-  exec)
-    exec_strict=0
-    if [[ "${1:-}" == "--strict" ]]; then
-      exec_strict=1
-      shift
-    fi
-    # Skip the -- separator if present
-    [[ "${1:-}" == "--" ]] && shift
-    [[ $# -eq 0 ]] && die "usage: sv exec -- <command> [args...]"
-    cmd_exec "${exec_strict}" "$@"
-    ;;
+  exec)      cmd_exec "$@" ;;
   update)    cmd_update ;;
   version|--version|-v)
     cmd_version ;;

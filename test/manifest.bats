@@ -134,14 +134,39 @@ EOF
   [ "$output" = "trimmed_val" ]
 }
 
-@test "no manifest injects all secrets" {
+@test "no manifest fails before running the child" {
   test_store_set ALL_KEY_A "val_a"
   test_store_set ALL_KEY_B "val_b"
-  # No .secrets file — should inject everything
   mkdir -p "$TEST_TMPDIR/no_manifest"
-  run bash -c "cd '$TEST_TMPDIR/no_manifest' && '$SV_BIN' exec -- bash -c 'echo \$ALL_KEY_A \$ALL_KEY_B'"
+  run bash -c "cd '$TEST_TMPDIR/no_manifest' && '$SV_BIN' exec -- bash -c 'touch should_not_exist'"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"no .secrets manifest found"* ]]
+  [ ! -e "$TEST_TMPDIR/no_manifest/should_not_exist" ]
+}
+
+@test "--all-secrets explicitly injects all secrets without a manifest" {
+  test_store_set ALL_KEY_A "val_a"
+  test_store_set ALL_KEY_B "val_b"
+  mkdir -p "$TEST_TMPDIR/no_manifest"
+  run bash -c "cd '$TEST_TMPDIR/no_manifest' && '$SV_BIN' exec --all-secrets -- bash -c 'echo \$ALL_KEY_A \$ALL_KEY_B'"
   [ "$status" -eq 0 ]
   [ "$output" = "val_a val_b" ]
+}
+
+@test "--all-secrets ignores a discovered manifest" {
+  test_store_set ALL_KEY_A "val_a"
+  test_store_set ALL_KEY_B "val_b"
+  echo "ALL_KEY_A" > "$TEST_TMPDIR/.secrets"
+  run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec --all-secrets -- bash -c 'echo \$ALL_KEY_A \$ALL_KEY_B'"
+  [ "$status" -eq 0 ]
+  [ "$output" = "val_a val_b" ]
+}
+
+@test "--all-secrets runs with an empty accessible vault" {
+  mkdir -p "$TEST_TMPDIR/no_manifest"
+  run bash -c "cd '$TEST_TMPDIR/no_manifest' && '$SV_BIN' exec --all-secrets -- echo empty_vault_ok"
+  [ "$status" -eq 0 ]
+  [ "$output" = "empty_vault_ok" ]
 }
 
 @test "manifest with mixed content: comments, blanks, and valid keys" {
@@ -156,4 +181,32 @@ EOF
   run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec -- printenv REAL_KEY"
   [ "$status" -eq 0 ]
   [ "$output" = "real_val" ]
+}
+
+@test "manifest rejects malformed and process-control keys" {
+  echo "BAD-KEY" > "$TEST_TMPDIR/.secrets"
+  run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec -- echo should_not_run"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"invalid key"* ]]
+
+  echo "LD_PRELOAD" > "$TEST_TMPDIR/.secrets"
+  run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec -- echo should_not_run"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"process-control environment variables"* ]]
+}
+
+@test "manifest rejects duplicate required or optional forms of one key" {
+  test_store_set DUPLICATE_MANIFEST_KEY "value"
+  printf "DUPLICATE_MANIFEST_KEY\nDUPLICATE_MANIFEST_KEY?\n" > "$TEST_TMPDIR/.secrets"
+  run bash -c "cd '$TEST_TMPDIR' && '$SV_BIN' exec -- echo should_not_run"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"duplicate manifest key"* ]]
+}
+
+@test "--all-secrets rejects malformed stored names" {
+  test_store_set "BAD-KEY" "value"
+  mkdir -p "$TEST_TMPDIR/no_manifest"
+  run bash -c "cd '$TEST_TMPDIR/no_manifest' && '$SV_BIN' exec --all-secrets -- echo should_not_run"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"invalid key"* ]]
 }
