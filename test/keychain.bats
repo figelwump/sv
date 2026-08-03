@@ -70,6 +70,14 @@ teardown() {
   [ "$first_line" = "ALPHA" ]
 }
 
+@test "sv ls works with the macOS system Bash" {
+  test_kc_set SYSTEM_BASH_KEY "value"
+
+  run /bin/bash "$SV_BIN" ls
+  [ "$status" -eq 0 ]
+  [ "$output" = "SYSTEM_BASH_KEY" ]
+}
+
 @test "sv ls shows message when no secrets stored" {
   run "$SV_BIN" ls
   [ "$status" -eq 0 ]

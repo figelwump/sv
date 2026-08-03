@@ -160,18 +160,21 @@ kc_rm() {
 # List all sv secret names from the Keychain.
 # Parses `security dump-keychain` output for our service prefix.
 kc_ls() {
-  local dump_file err_file err output line service
+  local dump_file err_file output_file err output line service
   dump_file="$(mktemp)"
   err_file="$(mktemp)"
+  output_file="$(mktemp)"
 
   if ! LC_ALL=C security dump-keychain >"${dump_file}" 2>"${err_file}"; then
     err="$(<"${err_file}")"
-    rm -f "${dump_file}" "${err_file}"
+    rm -f "${dump_file}" "${err_file}" "${output_file}"
     kc_emit_access_failure "list" "" "${err}"
     return "${SV_BACKEND_FAILURE_STATUS}"
   fi
 
-  if output="$({
+  # Keep the case statements outside command substitution: macOS Bash 3.2
+  # misparses their closing parentheses as the end of the substitution.
+  if {
     while IFS= read -r line; do
       case "${line}" in
         *'"svce"<blob>="'*)
@@ -186,14 +189,14 @@ kc_ls() {
       esac
     done < "${dump_file}"
     : # An empty listing is successful; keep pipefail focused on real parser/sort errors.
-  } | sort -u)"; then
-    :
+  } | sort -u > "${output_file}"; then
+    output="$(<"${output_file}")"
   else
-    rm -f "${dump_file}" "${err_file}"
+    rm -f "${dump_file}" "${err_file}" "${output_file}"
     kc_emit_access_failure "parse the listing from" "" ""
     return "${SV_BACKEND_FAILURE_STATUS}"
   fi
-  rm -f "${dump_file}" "${err_file}"
+  rm -f "${dump_file}" "${err_file}" "${output_file}"
   if [[ -n "${output}" ]]; then
     printf "%s\n" "${output}"
   fi
