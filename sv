@@ -696,6 +696,26 @@ doctor_check_pass() {
   fi
 }
 
+doctor_manifest_key_is_available() {
+  local key="$1" status
+
+  if store_has "${key}"; then
+    :
+  else
+    status=$?
+    return "${status}"
+  fi
+
+  case "${SV_BACKEND}" in
+    keychain)
+      store_get "${key}" >/dev/null
+      ;;
+    pass)
+      return 0
+      ;;
+  esac
+}
+
 doctor_check_manifest() {
   local manifest_path manifest_entries
   manifest_path="$(find_manifest)"
@@ -715,7 +735,7 @@ doctor_check_manifest() {
     return 0
   fi
 
-  local entry key
+  local entry key status
   local required_present=()
   local required_missing=()
   local optional_present=()
@@ -724,16 +744,26 @@ doctor_check_manifest() {
   while IFS= read -r entry; do
     key="$(manifest_entry_key "${entry}")"
     if manifest_entry_is_optional "${entry}"; then
-      if store_has "${key}"; then
+      if doctor_manifest_key_is_available "${key}"; then
         optional_present+=("${key}")
       else
-        optional_missing+=("${key}")
+        status=$?
+        if [[ ${status} -eq ${SV_BACKEND_FAILURE_STATUS} ]]; then
+          doctor_fail "optional secret is present, but its value is not readable: ${key}"
+        else
+          optional_missing+=("${key}")
+        fi
       fi
     else
-      if store_has "${key}"; then
+      if doctor_manifest_key_is_available "${key}"; then
         required_present+=("${key}")
       else
-        required_missing+=("${key}")
+        status=$?
+        if [[ ${status} -eq ${SV_BACKEND_FAILURE_STATUS} ]]; then
+          doctor_fail "required secret is present, but its value is not readable: ${key}"
+        else
+          required_missing+=("${key}")
+        fi
       fi
     fi
   done <<< "${manifest_entries}"

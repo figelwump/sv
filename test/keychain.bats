@@ -246,6 +246,55 @@ EOF
   rm -rf "${root}"
 }
 
+@test "sv doctor validates each present manifest Keychain value" {
+  local root fakebin project
+  root="$(mktemp -d)"
+  fakebin="${root}/bin"
+  project="${root}/project"
+  mkdir -p "${fakebin}" "${project}"
+  cat > "${fakebin}/security" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  dump-keychain)
+    printf '    "svce"<blob>="sv_test:READABLE_KEY"\n'
+    printf '    "svce"<blob>="sv_test:BLOCKED_KEY"\n'
+    ;;
+  find-generic-password)
+    case " $* " in
+      *" -s sv_test:READABLE_KEY "*)
+        case " $* " in
+          *" -w "*) printf 'readable_secret_value\n' ;;
+        esac
+        ;;
+      *" -s sv_test:BLOCKED_KEY "*)
+        case " $* " in
+          *" -w "*)
+            printf 'security: SecKeychainSearchCopyNext: User interaction is not allowed.\n' >&2
+            exit 1
+            ;;
+        esac
+        ;;
+      *)
+        printf 'unexpected Keychain item\n' >&2
+        exit 9
+        ;;
+    esac
+    ;;
+esac
+EOF
+  chmod +x "${fakebin}/security"
+  printf "READABLE_KEY\nBLOCKED_KEY\n" > "${project}/.secrets"
+
+  run bash -c "cd '$project' && PATH='$fakebin':\$PATH '$SV_BIN' doctor"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"macOS Keychain secret values are readable (checked READABLE_KEY)"* ]]
+  [[ "$output" == *"required secret is present, but its value is not readable: BLOCKED_KEY"* ]]
+  [[ "$output" == *"required secrets available: READABLE_KEY"* ]]
+  [[ "$output" != *"required secrets available: READABLE_KEY BLOCKED_KEY"* ]]
+  [[ "$output" != *"readable_secret_value"* ]]
+  rm -rf "${root}"
+}
+
 @test "sv doctor reports that an empty Keychain cannot exercise a value read" {
   local root fakebin
   root="$(mktemp -d)"

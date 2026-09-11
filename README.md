@@ -55,7 +55,7 @@ sv exec --key ANTHROPIC_API_KEY -- node reviewer.mjs
 
 On macOS, secrets are stored in the Keychain under the service prefix `sv:`. The native `security` CLI does the heavy lifting.
 
-On macOS, `sv doctor` checks Keychain metadata and, when at least one `sv:` item exists, reads and discards one existing item's password data. If metadata is accessible but that value read is blocked, `sv doctor` fails and skips manifest availability reporting. Retry from an interactive macOS session that can present a Keychain authorization prompt; if the read still fails, review the item's Access Control settings in Keychain Access.
+On macOS, `sv doctor` checks Keychain metadata and, when at least one `sv:` item exists, reads and discards one existing item's password data. It also reads and discards every present manifest item's password data before reporting that item as available. If metadata is accessible but a value read is blocked, `sv doctor` fails. Retry from an interactive macOS session that can present a Keychain authorization prompt; if the read still fails, review the item's Access Control settings in Keychain Access.
 
 On Linux, secrets are stored in `pass` under the `sv/` namespace inside your password store. `sv` expects `pass init <gpg-id>` to have already been run.
 
