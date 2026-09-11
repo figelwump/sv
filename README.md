@@ -55,6 +55,8 @@ sv exec --key ANTHROPIC_API_KEY -- node reviewer.mjs
 
 On macOS, secrets are stored in the Keychain under the service prefix `sv:`. The native `security` CLI does the heavy lifting.
 
+On macOS, `sv doctor` checks Keychain metadata and, when at least one `sv:` item exists, reads and discards one existing item's password data. It also reads and discards every present manifest item's password data before reporting that item as available. If metadata is accessible but a value read is blocked, `sv doctor` fails. Retry from an interactive macOS session that can present a Keychain authorization prompt; if the read still fails, review the item's Access Control settings in Keychain Access.
+
 On Linux, secrets are stored in `pass` under the `sv/` namespace inside your password store. `sv` expects `pass init <gpg-id>` to have already been run.
 
 `sv exec -- <cmd>` resolves the nearest `.secrets` manifest and injects those secrets as environment variables into the subprocess. The calling process (or agent) never sees the values. Exact-key mode (`--key`) bypasses manifest discovery, while `--all-secrets` explicitly opts into broad vault access.
@@ -189,7 +191,7 @@ These are practical barriers, not a hard sandbox. An agent with shell access cou
 
 ## Testing
 
-Tests use [bats-core](https://github.com/bats-core/bats-core) and run against the real backend — no mocks, no fakes.
+Tests use [bats-core](https://github.com/bats-core/bats-core). Most backend tests use the real backend; focused error-path tests replace the backend command with a local fake.
 
 - macOS tests use an isolated `sv_test:` Keychain namespace.
 - Linux tests use a temporary password store and temporary GPG home.

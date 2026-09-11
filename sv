@@ -546,32 +546,69 @@ doctor_check_cmd() {
   return 1
 }
 
+doctor_select_keychain_probe() {
+  local keychain_keys="$1"
+  local manifest_path manifest_entries entry manifest_key stored_key
+
+  manifest_path="$(find_manifest)"
+  if [[ -n "${manifest_path}" ]]; then
+    manifest_entries="$(read_manifest "${manifest_path}")"
+    if [[ -n "${manifest_entries}" ]]; then
+      while IFS= read -r entry; do
+        manifest_key="$(manifest_entry_key "${entry}")"
+        while IFS= read -r stored_key; do
+          if [[ "${manifest_key}" == "${stored_key}" ]]; then
+            printf "%s\n" "${manifest_key}"
+            return 0
+          fi
+        done <<< "${keychain_keys}"
+      done <<< "${manifest_entries}"
+    fi
+  fi
+
+  printf "%s\n" "${keychain_keys%%$'\n'*}"
+}
+
 doctor_check_keychain() {
-  local err_file err
+  local err_file err keychain_keys probe_key status
 
   doctor_info "backend: keychain"
 
   if doctor_check_cmd security "security command"; then
-    if security dump-keychain >/dev/null 2>&1; then
+    err_file="$(mktemp)"
+    if keychain_keys="$(kc_ls 2>"${err_file}")"; then
       doctor_ok "macOS Keychain listing is accessible"
     else
       doctor_fail "macOS Keychain listing is not accessible in this session"
+      doctor_next "Retry 'sv doctor' from an interactive macOS session that can access the login Keychain."
+      rm -f "${err_file}"
+      return 0
+    fi
+    rm -f "${err_file}"
+
+    if [[ -z "${keychain_keys}" ]]; then
+      doctor_info "no sv Keychain items found; secret value-read access was not tested"
+      return 0
     fi
 
+    probe_key="$(doctor_select_keychain_probe "${keychain_keys}")"
     err_file="$(mktemp)"
-    if security find-generic-password \
+    if LC_ALL=C security find-generic-password \
       -a "${SV_KEYCHAIN_ACCOUNT}" \
-      -s "${SV_SERVICE_PREFIX}__sv_doctor_probe__" \
+      -s "${SV_SERVICE_PREFIX}${probe_key}" \
       -w >/dev/null 2>"${err_file}"; then
-      doctor_ok "macOS Keychain lookup is accessible"
+      doctor_ok "macOS Keychain secret values are readable (checked ${probe_key})"
     else
+      status=$?
       err="$(<"${err_file}")"
-      if [[ "${err}" == *"could not be found"* ]]; then
-        doctor_ok "macOS Keychain lookup is accessible"
+      err="${err//$'\n'/ }"
+      if [[ -n "${err}" ]]; then
+        doctor_fail "macOS Keychain metadata is accessible, but secret value reads are blocked for ${probe_key}: ${err}"
       else
-        err="${err//$'\n'/ }"
-        doctor_fail "macOS Keychain lookup failed: ${err}"
+        doctor_fail "macOS Keychain metadata is accessible, but secret value reads are blocked for ${probe_key}: security exited with status ${status} without an error message"
       fi
+      doctor_next "Retry 'sv doctor' from an interactive macOS session that can present a Keychain authorization prompt."
+      doctor_next "If the read still fails, open Keychain Access and review Access Control for '${SV_SERVICE_PREFIX}${probe_key}'."
     fi
     rm -f "${err_file}"
   fi
@@ -659,6 +696,26 @@ doctor_check_pass() {
   fi
 }
 
+doctor_manifest_key_is_available() {
+  local key="$1" status
+
+  if store_has "${key}"; then
+    :
+  else
+    status=$?
+    return "${status}"
+  fi
+
+  case "${SV_BACKEND}" in
+    keychain)
+      store_get "${key}" >/dev/null
+      ;;
+    pass)
+      return 0
+      ;;
+  esac
+}
+
 doctor_check_manifest() {
   local manifest_path manifest_entries
   manifest_path="$(find_manifest)"
@@ -678,7 +735,7 @@ doctor_check_manifest() {
     return 0
   fi
 
-  local entry key
+  local entry key status
   local required_present=()
   local required_missing=()
   local optional_present=()
@@ -687,16 +744,26 @@ doctor_check_manifest() {
   while IFS= read -r entry; do
     key="$(manifest_entry_key "${entry}")"
     if manifest_entry_is_optional "${entry}"; then
-      if store_has "${key}"; then
+      if doctor_manifest_key_is_available "${key}"; then
         optional_present+=("${key}")
       else
-        optional_missing+=("${key}")
+        status=$?
+        if [[ ${status} -eq ${SV_BACKEND_FAILURE_STATUS} ]]; then
+          doctor_fail "optional secret is present, but its value is not readable: ${key}"
+        else
+          optional_missing+=("${key}")
+        fi
       fi
     else
-      if store_has "${key}"; then
+      if doctor_manifest_key_is_available "${key}"; then
         required_present+=("${key}")
       else
-        required_missing+=("${key}")
+        status=$?
+        if [[ ${status} -eq ${SV_BACKEND_FAILURE_STATUS} ]]; then
+          doctor_fail "required secret is present, but its value is not readable: ${key}"
+        else
+          required_missing+=("${key}")
+        fi
       fi
     fi
   done <<< "${manifest_entries}"

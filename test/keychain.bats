@@ -175,6 +175,152 @@ EOF
   rm -rf "${root}"
 }
 
+@test "sv doctor fails when Keychain metadata is accessible but value reads are blocked" {
+  local root fakebin project
+  root="$(mktemp -d)"
+  fakebin="${root}/bin"
+  project="${root}/project"
+  mkdir -p "${fakebin}" "${project}"
+  cat > "${fakebin}/security" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  dump-keychain)
+    printf '    "svce"<blob>="sv_test:BLOCKED_KEY"\n'
+    ;;
+  find-generic-password)
+    printf 'security: SecKeychainSearchCopyNext: User interaction is not allowed.\n' >&2
+    exit 1
+    ;;
+esac
+EOF
+  chmod +x "${fakebin}/security"
+  echo "BLOCKED_KEY" > "${project}/.secrets"
+
+  run bash -c "cd '$project' && PATH='$fakebin':\$PATH '$SV_BIN' doctor"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"macOS Keychain listing is accessible"* ]]
+  [[ "$output" == *"metadata is accessible, but secret value reads are blocked for BLOCKED_KEY"* ]]
+  [[ "$output" == *"project manifest status skipped because backend checks failed"* ]]
+  [[ "$output" != *"required secrets available"* ]]
+  [[ "$output" == *"review Access Control for 'sv_test:BLOCKED_KEY'"* ]]
+  rm -rf "${root}"
+}
+
+@test "sv doctor discards a successful Keychain value read" {
+  local root fakebin project
+  root="$(mktemp -d)"
+  fakebin="${root}/bin"
+  project="${root}/project"
+  mkdir -p "${fakebin}" "${project}"
+  cat > "${fakebin}/security" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  dump-keychain)
+    printf '    "svce"<blob>="sv_test:ALPHA_OTHER_KEY"\n'
+    printf '    "svce"<blob>="sv_test:READABLE_KEY"\n'
+    ;;
+  find-generic-password)
+    case " $* " in
+      *" -s sv_test:READABLE_KEY "*)
+        case " $* " in
+          *" -w "*) printf 'doctor_probe_secret_value\n' ;;
+        esac
+        ;;
+      *)
+        printf 'doctor selected a non-manifest Keychain item\n' >&2
+        exit 9
+        ;;
+    esac
+    ;;
+esac
+EOF
+  chmod +x "${fakebin}/security"
+  echo "READABLE_KEY" > "${project}/.secrets"
+
+  run bash -c "cd '$project' && PATH='$fakebin':\$PATH '$SV_BIN' doctor"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"macOS Keychain secret values are readable (checked READABLE_KEY)"* ]]
+  [[ "$output" == *"required secrets available: READABLE_KEY"* ]]
+  [[ "$output" != *"doctor_probe_secret_value"* ]]
+  [[ "$output" != *"doctor selected a non-manifest Keychain item"* ]]
+  rm -rf "${root}"
+}
+
+@test "sv doctor validates each present manifest Keychain value" {
+  local root fakebin project
+  root="$(mktemp -d)"
+  fakebin="${root}/bin"
+  project="${root}/project"
+  mkdir -p "${fakebin}" "${project}"
+  cat > "${fakebin}/security" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  dump-keychain)
+    printf '    "svce"<blob>="sv_test:READABLE_KEY"\n'
+    printf '    "svce"<blob>="sv_test:BLOCKED_KEY"\n'
+    ;;
+  find-generic-password)
+    case " $* " in
+      *" -s sv_test:READABLE_KEY "*)
+        case " $* " in
+          *" -w "*) printf 'readable_secret_value\n' ;;
+        esac
+        ;;
+      *" -s sv_test:BLOCKED_KEY "*)
+        case " $* " in
+          *" -w "*)
+            printf 'security: SecKeychainSearchCopyNext: User interaction is not allowed.\n' >&2
+            exit 1
+            ;;
+        esac
+        ;;
+      *)
+        printf 'unexpected Keychain item\n' >&2
+        exit 9
+        ;;
+    esac
+    ;;
+esac
+EOF
+  chmod +x "${fakebin}/security"
+  printf "READABLE_KEY\nBLOCKED_KEY\n" > "${project}/.secrets"
+
+  run bash -c "cd '$project' && PATH='$fakebin':\$PATH '$SV_BIN' doctor"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"macOS Keychain secret values are readable (checked READABLE_KEY)"* ]]
+  [[ "$output" == *"required secret is present, but its value is not readable: BLOCKED_KEY"* ]]
+  [[ "$output" == *"required secrets available: READABLE_KEY"* ]]
+  [[ "$output" != *"required secrets available: READABLE_KEY BLOCKED_KEY"* ]]
+  [[ "$output" != *"readable_secret_value"* ]]
+  rm -rf "${root}"
+}
+
+@test "sv doctor reports that an empty Keychain cannot exercise a value read" {
+  local root fakebin
+  root="$(mktemp -d)"
+  fakebin="${root}/bin"
+  mkdir -p "${fakebin}"
+  cat > "${fakebin}/security" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  dump-keychain)
+    exit 0
+    ;;
+  *)
+    printf 'unexpected Keychain value-read probe\n' >&2
+    exit 9
+    ;;
+esac
+EOF
+  chmod +x "${fakebin}/security"
+
+  run env PATH="${fakebin}:${PATH}" "$SV_BIN" doctor
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"no sv Keychain items found; secret value-read access was not tested"* ]]
+  [[ "$output" != *"unexpected Keychain value-read probe"* ]]
+  rm -rf "${root}"
+}
+
 @test "sv ls handles a literal service prefix with regex and path characters" {
   local prefix='sv_test.literal.[x]/*:'
   security add-generic-password -a "${USER}" -s "${prefix}BRAVO" -w "b" -U >/dev/null 2>&1
