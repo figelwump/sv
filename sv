@@ -1280,8 +1280,10 @@ cmd_set() {
 
   local value
   if [[ ! -t 0 ]]; then
-    # Reading from pipe/stdin
-    IFS= read -r value
+    # Reading from pipe/stdin. read returns nonzero at end of input without a
+    # trailing newline even though it filled value; the empty check below
+    # handles input that has no value.
+    IFS= read -r value || true
   else
     # Interactive prompt
     printf "value for %s: " "$key" >&2
