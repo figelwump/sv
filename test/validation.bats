@@ -101,6 +101,12 @@ teardown() {
   [[ "$output" == *"no value provided"* ]]
 }
 
+@test "sv set rejects zero-byte stdin" {
+  run bash -c "printf '' | '$SV_BIN' set MY_KEY"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"no value provided"* ]]
+}
+
 # ─── Missing args / usage ───────────────────────────────────────────────────
 
 @test "sv set with no key shows usage" {

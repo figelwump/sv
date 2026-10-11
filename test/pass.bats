@@ -29,6 +29,13 @@ teardown() {
   [ "$result" = "test_value_123" ]
 }
 
+@test "sv set stores a piped value without a trailing newline in password-store" {
+  run bash -c "printf '%s' 'no_newline_value' | '$SV_BIN' set MY_KEY"
+  [ "$status" -eq 0 ]
+  result="$(test_pass_get MY_KEY)"
+  [ "$result" = "no_newline_value" ]
+}
+
 @test "sv set updates an existing secret in password-store" {
   echo "old_value" | "$SV_BIN" set MY_KEY
   echo "new_value" | "$SV_BIN" set MY_KEY
