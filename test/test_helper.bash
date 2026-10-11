@@ -2,6 +2,11 @@
 
 export SV_SERVICE_PREFIX="sv_test:"
 
+# Keep a developer's real 1Password CLI out of tests that exercise missing
+# keys. test/op.bats re-enables the fetch against a fake `op`.
+export SV_OP_FETCH=0
+unset OP_SERVICE_ACCOUNT_TOKEN SV_OP_VAULT SV_OP_FIELD
+
 # Resolve the path to the sv script under test
 SV_BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/sv"
 

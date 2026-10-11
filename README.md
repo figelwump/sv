@@ -132,6 +132,77 @@ sv exec --all-secrets -- legacy-command
 
 `--strict` is manifest-only and treats optional `KEY?` entries as required. It cannot be combined with `--key` or `--all-secrets`. Duplicate `--key` names and invalid environment-variable names are rejected.
 
+## 1Password sync (optional)
+
+1Password can be the source of truth for your secrets, with the local Keychain or password store as the copy that `sv exec` reads. 1Password is optional: only `sv sync` and the fetch of a missing key call the 1Password CLI (`op`). Without `op`, every command works as before.
+
+### Setup
+
+1. Install the 1Password CLI (macOS: `brew install 1password-cli`). On a machine with the 1Password app, turn on **Settings > Developer > Integrate with 1Password CLI**.
+2. Create a vault named `sv`.
+3. Add one item per secret. The item title is the key name, such as `GH_TOKEN`, and the value goes in the item's `password` field. A **Password** item has this field.
+
+### Commands
+
+```bash
+sv sync              # copy every item in the vault into the local store
+sv sync GH_TOKEN     # copy one key, e.g. after you rotate it in 1Password
+```
+
+- `sv sync` never prints values. It reports each key it synced and each key it could not sync.
+- If 1Password cannot supply a value (no such item, an empty value, or a value with more than one line), the stored value stays unchanged and `sv sync` exits nonzero.
+- A title that is not a valid key name, such as `My Login`, is skipped with a warning.
+- 1Password matches titles without regard to case. If two titles differ only in case, `sv sync` skips both and exits nonzero.
+
+### Moving existing secrets into 1Password
+
+`scripts/migrate-to-1password.sh` copies the secrets already in `sv` into the vault, then checks that 1Password holds the same value for each key:
+
+```bash
+op vault create sv                    # once, if the vault does not exist
+scripts/migrate-to-1password.sh --skip TOASTTY_REMOTE_GUI_HOST
+```
+
+- Each key becomes a Password item titled with the key name. Items already in the vault are left unchanged, so you can run the script again.
+- Values never appear in command arguments or output.
+- The script prints `copied`, `exists`, `skip`, `match`, `DIFFERS`, or `FAILED` for each key, and exits nonzero if any key differs or failed.
+- `DIFFERS` means the vault already had a different value. Running `sv sync` would replace your local value with the vault's value, so resolve those keys first.
+- Use `--skip` for keys whose values differ between machines. `sv sync` copies every vault item to every machine. `OP_SERVICE_ACCOUNT_TOKEN` is always skipped.
+- It needs an `op` that can create items, such as one signed in through the 1Password app. A read-only service account cannot create items.
+
+### Fetch of missing keys in `sv exec`
+
+When `sv exec` finds a required key missing from the local store, it reads that key from 1Password once, stores it, and continues. Later runs read only the local store.
+
+- Only keys that would otherwise make `sv exec` fail are fetched: required manifest entries, every entry under `--strict`, and `--key` names. Optional `KEY?` entries are never fetched, so a run never waits on 1Password for a key that is intentionally absent.
+- A successful run never calls `op`, so `sv exec` is as fast as before.
+- On a machine with the 1Password app, a fetch can show a 1Password authorization prompt. If nobody answers within `SV_OP_TIMEOUT_SECONDS`, the fetch fails and `sv exec` reports the key as missing, so an unattended agent does not hang.
+- Set `SV_OP_FETCH=0` to turn off the fetch.
+
+Rotation is not automatic. After you change a value in 1Password, run `sv sync KEY` on each machine that has the old value.
+
+### Headless machines
+
+A machine without the 1Password app, such as a build host reached over SSH, can use a 1Password service account. Give the account read-only access to the `sv` vault, then store its token in `sv`:
+
+```bash
+sv set OP_SERVICE_ACCOUNT_TOKEN
+sv sync
+```
+
+`sv` passes the stored token only to `op`, through that process's environment. Commands run by `sv exec` do not receive it unless a manifest lists it. A token already set in the environment takes precedence. Use one service account per machine, so that you can revoke one machine's access without affecting the others.
+
+### Settings
+
+| Variable | Default | Effect |
+|---|---|---|
+| `SV_OP_VAULT` | `sv` | Vault name or ID to read from |
+| `SV_OP_FIELD` | `password` | Field that holds each value |
+| `SV_OP_FETCH` | `1` | `0` turns off the fetch in `sv exec` |
+| `SV_OP_TIMEOUT_SECONDS` | `60` | How long `sv` waits for one `op` call before it fails |
+
+`sv doctor` reports whether `op` is installed and which authentication it will use. It does not call `op`, so it never shows a 1Password prompt.
+
 ## Agent usage
 
 Agents normally use manifest-scoped `sv exec` and do not guess transitive dependencies. They never see the actual values:
@@ -185,6 +256,7 @@ Do NOT use `sv get`, `printenv`, `env`, `security find-generic-password`, or
 - **Process-control environment names are rejected.** Secret selection cannot replace loader, shell-startup, or executable-search variables such as `LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, `BASH_ENV`, or `PATH`.
 - **Broad execution is explicit.** `--all-secrets` is the only mode that injects the complete vault and ignores a discovered manifest.
 - **Backend failures remain distinct from missing keys.** An inaccessible Keychain or password store fails before child execution instead of being reported as an absent credential or empty vault.
+- **1Password reads stay narrow.** `sv sync` and the fetch of a missing key write values straight into the local store without printing them. A stored service-account token reaches only the `op` process.
 - **Exit status `2` identifies backend access failures.** Missing requested keys and invalid usage remain ordinary nonzero failures; callers can distinguish an inaccessible vault without inspecting secret values.
 
 These are practical barriers, not a hard sandbox. An agent with shell access could still extract secrets through other means. The real enforcement is agent instructions.
@@ -195,6 +267,7 @@ Tests use [bats-core](https://github.com/bats-core/bats-core). Most backend test
 
 - macOS tests use an isolated `sv_test:` Keychain namespace.
 - Linux tests use a temporary password store and temporary GPG home.
+- 1Password tests (`test/op.bats`) use a fake `op` CLI. Other test files set `SV_OP_FETCH=0`, so no test reaches a real 1Password account.
 
 ```bash
 bats --version           # verify bats is installed
@@ -215,11 +288,16 @@ make test-purge          # purge macOS test secrets
 | `sv exec [--strict] -- <cmd>` | Run with the nearest `.secrets` manifest |
 | `sv exec --key <KEY> [--key <KEY>...] -- <cmd>` | Run with exactly the named required secrets |
 | `sv exec --all-secrets -- <cmd>` | Explicitly run with every stored secret |
+| `sv sync [KEY...]` | Copy secrets from 1Password into the local store |
 | `sv unlock <KEY>` | Unlock Linux GPG agent without printing a secret |
 | `sv doctor` | Check backend setup and common failures |
 | `sv update` | Update to latest version |
 | `sv version` | Print version |
 | `sv help` | Show help |
+
+## Upgrading to 0.3.0
+
+Version 0.3.0 adds `sv sync` and the fetch of missing keys. Nothing changes on machines without `op`. On a machine with `op`, a `sv exec` that would fail on a missing required key now first tries to read that key from 1Password, which can show a 1Password prompt. Set `SV_OP_FETCH=0` to keep the earlier behavior.
 
 ## Migrating from 0.1.x
 
