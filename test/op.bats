@@ -64,11 +64,49 @@ case "$1 $2" in
     ;;
   "item list")
     vault="$4"
-    if [[ ! -f "${FAKE_OP_ROOT}/${vault}.json" ]]; then
+    if [[ -f "${FAKE_OP_ROOT}/${vault}.json" ]]; then
+      cat "${FAKE_OP_ROOT}/${vault}.json"
+    elif [[ -d "${FAKE_OP_ROOT}/${vault}" ]]; then
+      # Without a fixture listing, list the item directories.
+      printf "["
+      sep=""
+      for dir in "${FAKE_OP_ROOT}/${vault}"/*/; do
+        [[ -d "${dir}" ]] || continue
+        dir="${dir%/}"
+        printf '%s\n  {\n    "id": "x",\n    "title": "%s"\n  }' "${sep}" "${dir##*/}"
+        sep=","
+      done
+      printf "\n]\n"
+    else
       printf "[ERROR] \"%s\" isn't a vault in this account\n" "${vault}" >&2
       exit 1
     fi
-    cat "${FAKE_OP_ROOT}/${vault}.json"
+    ;;
+  "item create")
+    # Expects: item create --vault <vault> -  with a JSON item on stdin.
+    vault="$4"
+    json="$(cat)"
+    unescape() {
+      local s="$1" out="" i c
+      for ((i = 0; i < ${#s}; i++)); do
+        c="${s:i:1}"
+        if [[ "${c}" == "\\" ]]; then
+          i=$((i + 1))
+          c="${s:i:1}"
+        fi
+        out+="${c}"
+      done
+      printf "%s" "${out}"
+    }
+    str='"(([^"\\]|\\.)*)"'
+    [[ "${json}" =~ \"title\":${str} ]] || { echo "[ERROR] no title" >&2; exit 1; }
+    title="$(unescape "${BASH_REMATCH[1]}")"
+    [[ "${json}" =~ \"label\":${str} ]] || { echo "[ERROR] no field label" >&2; exit 1; }
+    label="$(unescape "${BASH_REMATCH[1]}")"
+    [[ "${json}" =~ \"value\":${str} ]] || { echo "[ERROR] no field value" >&2; exit 1; }
+    mkdir -p "${FAKE_OP_ROOT}/${vault}/${title}"
+    unescape "${BASH_REMATCH[1]}" > "${FAKE_OP_ROOT}/${vault}/${title}/${label}"
+    printf '{"id": "created", "title": "%s"}\n' "${title}"
     ;;
   *)
     printf "unexpected op call: %s\n" "$*" >&2
@@ -508,4 +546,73 @@ EOF
   [[ "$output" == *"required secrets missing: MISSING_FOR_DOCTOR"* ]]
   [[ "$output" == *"service-account token stored in sv as OP_SERVICE_ACCOUNT_TOKEN"* ]]
   [ "$(op_call_count)" -eq 0 ]
+}
+
+# ─── scripts/migrate-to-1password.sh ─────────────────────────────────────────
+
+MIGRATE_BIN="$(dirname "$SV_BIN")/scripts/migrate-to-1password.sh"
+
+# Run the migration script with the fake op and this checkout's sv on PATH.
+run_migrate() {
+  ln -sf "$SV_BIN" "$FAKEBIN/sv"
+  run bash -c "cd '$TEST_TMPDIR' && PATH='$FAKEBIN':\$PATH '$MIGRATE_BIN' $*"
+}
+
+@test "migration copies every key into 1Password and confirms the values" {
+  local tricky='has "quotes", \back\slashes, $dollar and `ticks`'
+  mkdir -p "$FAKE_OP_ROOT/sv"
+  test_store_set MIG_PLAIN "plain_value"
+  test_store_set MIG_TRICKY "$tricky"
+  test_store_set MIG_SKIPPED "skipped_value"
+  test_store_set OP_SERVICE_ACCOUNT_TOKEN "token_value"
+
+  run_migrate --skip MIG_SKIPPED
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"copied   MIG_PLAIN"* ]]
+  [[ "$output" == *"copied   MIG_TRICKY"* ]]
+  [[ "$output" == *"match    MIG_PLAIN"* ]]
+  [[ "$output" == *"match    MIG_TRICKY"* ]]
+  [[ "$output" == *"skip     MIG_SKIPPED"* ]]
+  [[ "$output" == *"skip     OP_SERVICE_ACCOUNT_TOKEN"* ]]
+  [ "$(cat "$FAKE_OP_ROOT/sv/MIG_PLAIN/password")" = "plain_value" ]
+  [ "$(cat "$FAKE_OP_ROOT/sv/MIG_TRICKY/password")" = "$tricky" ]
+  [ ! -e "$FAKE_OP_ROOT/sv/MIG_SKIPPED" ]
+  [ ! -e "$FAKE_OP_ROOT/sv/OP_SERVICE_ACCOUNT_TOKEN" ]
+  [[ "$output" != *"plain_value"* ]]
+  ! grep -qE "plain_value|quotes|token_value" "$FAKE_OP_LOG"
+}
+
+@test "migration leaves existing items unchanged and reports differences" {
+  op_item sv MIG_SAME "same_value"
+  op_item sv MIG_DIFFERENT "vault_value"
+  test_store_set MIG_SAME "same_value"
+  test_store_set MIG_DIFFERENT "local_value"
+
+  run_migrate
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"exists   MIG_SAME (left unchanged)"* ]]
+  [[ "$output" == *"match    MIG_SAME"* ]]
+  [[ "$output" == *"DIFFERS  MIG_DIFFERENT"* ]]
+  [ "$(cat "$FAKE_OP_ROOT/sv/MIG_DIFFERENT/password")" = "vault_value" ]
+  [ "$(test_store_get MIG_DIFFERENT)" = "local_value" ]
+}
+
+@test "migrated items sync back unchanged" {
+  local tricky='round "trip" \value'
+  mkdir -p "$FAKE_OP_ROOT/sv"
+  test_store_set MIG_ROUND "$tricky"
+  run_migrate
+  [ "$status" -eq 0 ]
+
+  test_store_rm MIG_ROUND
+  sv_with_op sync MIG_ROUND
+  [ "$status" -eq 0 ]
+  [ "$(test_store_get MIG_ROUND)" = "$tricky" ]
+}
+
+@test "migration explains how to create a missing vault" {
+  test_store_set MIG_NO_VAULT "value"
+  run_migrate
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"op vault create sv"* ]]
 }

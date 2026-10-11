@@ -154,6 +154,22 @@ sv sync GH_TOKEN     # copy one key, e.g. after you rotate it in 1Password
 - A title that is not a valid key name, such as `My Login`, is skipped with a warning.
 - 1Password matches titles without regard to case. If two titles differ only in case, `sv sync` skips both and exits nonzero.
 
+### Moving existing secrets into 1Password
+
+`scripts/migrate-to-1password.sh` copies the secrets already in `sv` into the vault, then checks that 1Password holds the same value for each key:
+
+```bash
+op vault create sv                    # once, if the vault does not exist
+scripts/migrate-to-1password.sh --skip TOASTTY_REMOTE_GUI_HOST
+```
+
+- Each key becomes a Password item titled with the key name. Items already in the vault are left unchanged, so you can run the script again.
+- Values never appear in command arguments or output.
+- The script prints `copied`, `exists`, `skip`, `match`, `DIFFERS`, or `FAILED` for each key, and exits nonzero if any key differs or failed.
+- `DIFFERS` means the vault already had a different value. Running `sv sync` would replace your local value with the vault's value, so resolve those keys first.
+- Use `--skip` for keys whose values differ between machines. `sv sync` copies every vault item to every machine. `OP_SERVICE_ACCOUNT_TOKEN` is always skipped.
+- It needs an `op` that can create items, such as one signed in through the 1Password app. A read-only service account cannot create items.
+
 ### Fetch of missing keys in `sv exec`
 
 When `sv exec` finds a required key missing from the local store, it reads that key from 1Password once, stores it, and continues. Later runs read only the local store.
