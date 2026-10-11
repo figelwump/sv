@@ -14,6 +14,7 @@
 #   sv exec --key <KEY> [--key <KEY>...] -- <cmd> [args]
 #   sv exec --all-secrets -- <cmd> [args]
 #                               Run a command with selected secrets as env vars
+#   sv sync [KEY...]           Copy secrets from 1Password into the local store
 #   sv unlock <KEY>            Unlock Linux GPG agent without printing a secret
 #   sv doctor                  Check backend setup and common failures
 #   sv update                  Update sv to the latest version
@@ -23,7 +24,7 @@
 
 set -euo pipefail
 
-readonly SV_VERSION="0.2.0"
+readonly SV_VERSION="0.3.0"
 readonly SV_REPO="figelwump/sv"
 readonly SV_RAW_URL="https://raw.githubusercontent.com/${SV_REPO}/main/sv"
 readonly SV_SERVICE_PREFIX="${SV_SERVICE_PREFIX:-sv:}"
@@ -32,6 +33,11 @@ readonly SV_MANIFEST=".secrets"
 readonly SV_PASS_NAMESPACE="sv"
 readonly SV_BACKEND_FAILURE_STATUS=2
 readonly SV_PASS_TIMEOUT_SECONDS="${SV_PASS_TIMEOUT_SECONDS:-8}"
+readonly SV_OP_VAULT="${SV_OP_VAULT:-sv}"
+readonly SV_OP_FIELD="${SV_OP_FIELD:-password}"
+readonly SV_OP_TOKEN_KEY="OP_SERVICE_ACCOUNT_TOKEN"
+readonly SV_OP_TIMEOUT_SECONDS="${SV_OP_TIMEOUT_SECONDS:-60}"
+readonly SV_OP_TIMEOUT_STATUS=124
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -480,6 +486,227 @@ store_ls() {
   esac
 }
 
+# ─── 1Password (optional) ─────────────────────────────────────────────────────
+#
+# 1Password is an optional upstream source. Only `sv sync` and the fetch of a
+# missing required key in `sv exec` call the `op` CLI; every other command works
+# without it. Each 1Password item in the vault is named after its sv key and
+# holds the value in one field.
+
+# Service-account token read from the local store. It is passed only to `op`
+# through that child's environment and is never exported to other processes.
+SV_OP_STORED_TOKEN=""
+
+op_available() {
+  command -v op >/dev/null 2>&1
+}
+
+op_fetch_enabled() {
+  [[ "${SV_OP_FETCH:-1}" != "0" ]] && op_available
+}
+
+op_reference() {
+  printf "op://%s/%s/%s\n" "${SV_OP_VAULT}" "$1" "${SV_OP_FIELD}"
+}
+
+# Load a stored service-account token when the caller did not provide one.
+# This lets a headless machine authenticate `op` without a shell-profile export.
+# Returns SV_BACKEND_FAILURE_STATUS when the local store cannot be read.
+op_prepare_auth() {
+  local token status
+
+  [[ -z "${OP_SERVICE_ACCOUNT_TOKEN:-}" ]] || return 0
+
+  if store_has "${SV_OP_TOKEN_KEY}"; then
+    if token="$(store_get "${SV_OP_TOKEN_KEY}")"; then
+      SV_OP_STORED_TOKEN="${token}"
+      return 0
+    else
+      status=$?
+      [[ "${status}" -ne "${SV_BACKEND_FAILURE_STATUS}" ]] || return "${status}"
+    fi
+  else
+    status=$?
+    [[ "${status}" -ne "${SV_BACKEND_FAILURE_STATUS}" ]] || return "${status}"
+  fi
+}
+
+# Run `op` with a time limit. `op` can wait indefinitely, for example on an
+# authorization prompt nobody answers, and an agent's `sv exec` must fail
+# instead of hanging. macOS has no timeout(1), so a background watchdog polls
+# once per second. Its output goes to /dev/null so that a caller's command
+# substitution does not wait for it. Returns SV_OP_TIMEOUT_STATUS on timeout.
+op_cli() {
+  local pid watchdog marker status
+
+  [[ "${SV_OP_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ ]] \
+    || die "SV_OP_TIMEOUT_SECONDS must be a whole number of seconds, not '${SV_OP_TIMEOUT_SECONDS}'"
+
+  # The watchdog writes to this private file on timeout. Keeping the file
+  # (rather than recreating its name) avoids a symlink race in a shared /tmp.
+  marker="$(mktemp)"
+
+  # Background `op` as a simple command so that $! is the op process itself
+  # and the watchdog's kill reaches it.
+  if [[ -n "${SV_OP_STORED_TOKEN}" ]]; then
+    OP_SERVICE_ACCOUNT_TOKEN="${SV_OP_STORED_TOKEN}" op "$@" &
+  else
+    op "$@" &
+  fi
+  pid=$!
+  (
+    elapsed=0
+    while kill -0 "${pid}" 2>/dev/null; do
+      if [[ ${elapsed} -ge ${SV_OP_TIMEOUT_SECONDS} ]]; then
+        printf "timeout\n" > "${marker}"
+        kill "${pid}" 2>/dev/null
+        sleep 2
+        # Escalate if op ignores TERM.
+        if kill -0 "${pid}" 2>/dev/null; then
+          kill -KILL "${pid}" 2>/dev/null
+        fi
+        exit 0
+      fi
+      sleep 1
+      elapsed=$((elapsed + 1))
+    done
+  ) </dev/null >/dev/null 2>&1 &
+  watchdog=$!
+
+  if wait "${pid}"; then
+    status=0
+  else
+    status=$?
+  fi
+  kill "${watchdog}" 2>/dev/null || true
+  wait "${watchdog}" 2>/dev/null || true
+
+  if [[ -s "${marker}" ]]; then
+    status="${SV_OP_TIMEOUT_STATUS}"
+  fi
+  rm -f "${marker}"
+  return "${status}"
+}
+
+op_failure_detail() {
+  local status="$1" err="$2"
+
+  if [[ "${status}" -eq "${SV_OP_TIMEOUT_STATUS}" ]]; then
+    printf "op did not respond within %s seconds (a 1Password prompt may be waiting; SV_OP_TIMEOUT_SECONDS sets the limit)\n" \
+      "${SV_OP_TIMEOUT_SECONDS}"
+  elif [[ -n "${err}" ]]; then
+    printf "%s\n" "${err//$'\n'/ }"
+  else
+    printf "op exited with status %s\n" "${status}"
+  fi
+}
+
+# Copy one key from 1Password into the active backend.
+# Writes only status messages to stderr. On any failure the stored value is
+# left unchanged. Returns SV_OP_TIMEOUT_STATUS when `op` timed out, so callers
+# can stop instead of waiting again for each remaining key.
+op_sync_key() {
+  local key="$1"
+  local reference err_file err value status
+  reference="$(op_reference "${key}")"
+  err_file="$(mktemp)"
+
+  if value="$(op_cli read "${reference}" 2>"${err_file}")"; then
+    rm -f "${err_file}"
+  else
+    status=$?
+    err="$(<"${err_file}")"
+    rm -f "${err_file}"
+    printf "sv: could not read %s from 1Password (%s): %s\n" \
+      "${key}" "${reference}" "$(op_failure_detail "${status}" "${err}")" >&2
+    [[ "${status}" -ne "${SV_OP_TIMEOUT_STATUS}" ]] || return "${status}"
+    return 1
+  fi
+
+  if [[ -z "${value}" ]]; then
+    printf "sv: 1Password returned an empty value for %s (%s); the stored value is unchanged\n" \
+      "${key}" "${reference}" >&2
+    return 1
+  fi
+
+  # Match `sv set`, which stores one line. The macOS Keychain also returns
+  # multi-line passwords hex-encoded, which would inject the wrong value.
+  if [[ "${value}" == *$'\n'* ]]; then
+    printf "sv: the 1Password value for %s (%s) has more than one line; sv stores single-line values\n" \
+      "${key}" "${reference}" >&2
+    return 1
+  fi
+
+  if ! store_set "${key}" "${value}"; then
+    printf "sv: failed to store %s in the local backend\n" "${key}" >&2
+    return 1
+  fi
+}
+
+# Print the item titles in the configured vault, one per line.
+op_list_titles() {
+  local json err_file err status rest pattern
+  err_file="$(mktemp)"
+
+  if json="$(op_cli item list --vault "${SV_OP_VAULT}" --format json 2>"${err_file}")"; then
+    rm -f "${err_file}"
+  else
+    status=$?
+    err="$(<"${err_file}")"
+    rm -f "${err_file}"
+    die "could not list 1Password vault '${SV_OP_VAULT}': $(op_failure_detail "${status}" "${err}")"
+  fi
+
+  # A JSON string cannot contain an unescaped quote, so in valid JSON every
+  # `"title":` is an object key, and only item objects have a title. Escaped
+  # titles are captured raw and then rejected as invalid key names.
+  pattern='"title"[[:space:]]*:[[:space:]]*"(([^"\\]|\\.)*)"'
+  rest="${json}"
+  while [[ "${rest}" =~ ${pattern} ]]; do
+    printf "%s\n" "${BASH_REMATCH[1]}"
+    rest="${rest#*"${BASH_REMATCH[0]}"}"
+  done
+}
+
+# Try to fill missing required keys from 1Password before `sv exec` fails.
+# Prints each key it stored on stdout. Runs only on the path that would
+# otherwise fail, so successful runs never call `op`. Returns
+# SV_BACKEND_FAILURE_STATUS when a stored service-account token is unreadable.
+op_fetch_missing() {
+  local key status
+
+  op_fetch_enabled || return 0
+  if op_prepare_auth; then
+    :
+  else
+    return $?
+  fi
+
+  for key in "$@"; do
+    printf "sv: %s is missing locally; reading it from 1Password\n" "${key}" >&2
+    # Keep `op` off the child's stdin, which may carry piped input.
+    if op_sync_key "${key}" </dev/null; then
+      printf "sv: stored %s from 1Password\n" "${key}" >&2
+      printf "%s\n" "${key}"
+    else
+      status=$?
+      if [[ "${status}" -eq "${SV_OP_TIMEOUT_STATUS}" ]]; then
+        printf "sv: op timed out; not reading the remaining missing keys from 1Password\n" >&2
+        return 0
+      fi
+    fi
+  done
+}
+
+list_contains() {
+  local needle="$1" item
+  shift
+  for item in "$@"; do
+    [[ "${item}" != "${needle}" ]] || return 0
+  done
+  return 1
+}
+
 # ─── Doctor ───────────────────────────────────────────────────────────────────
 
 DOCTOR_FAILURES=0
@@ -785,6 +1012,37 @@ doctor_check_manifest() {
   fi
 }
 
+# Report optional 1Password setup without calling `op`, so doctor never
+# triggers an authorization prompt or a network request.
+doctor_check_op() {
+  local path
+  path="$(command -v op 2>/dev/null || true)"
+
+  if [[ -z "${path}" ]]; then
+    doctor_info "1Password CLI: not installed (optional; needed only for sv sync and for fetching missing keys)"
+    return 0
+  fi
+
+  doctor_ok "1Password CLI: ${path} (reads op://${SV_OP_VAULT}/<KEY>/${SV_OP_FIELD})"
+
+  if [[ "${SV_OP_FETCH:-1}" == "0" ]]; then
+    doctor_info "sv exec does not fetch missing keys from 1Password (SV_OP_FETCH=0)"
+  fi
+
+  if [[ -n "${OP_SERVICE_ACCOUNT_TOKEN:-}" ]]; then
+    doctor_info "1Password auth: service-account token from the environment"
+    return 0
+  fi
+
+  local status=0
+  store_has "${SV_OP_TOKEN_KEY}" 2>/dev/null || status=$?
+  case "${status}" in
+    0) doctor_info "1Password auth: service-account token stored in sv as ${SV_OP_TOKEN_KEY}" ;;
+    "${SV_BACKEND_FAILURE_STATUS}") doctor_info "1Password auth: could not check for a stored ${SV_OP_TOKEN_KEY}; the local store is not accessible" ;;
+    *) doctor_info "1Password auth: 1Password app integration or an op signin session" ;;
+  esac
+}
+
 cmd_doctor() {
   DOCTOR_FAILURES=0
   DOCTOR_WARNINGS=0
@@ -798,6 +1056,7 @@ cmd_doctor() {
   esac
 
   doctor_check_manifest
+  doctor_check_op
 
   if [[ ${DOCTOR_FAILURES} -gt 0 ]]; then
     printf "sv doctor: %d failure(s), %d warning(s)\n" "${DOCTOR_FAILURES}" "${DOCTOR_WARNINGS}"
@@ -859,9 +1118,13 @@ manifest_entry_is_optional() {
   [[ "$1" == *\? ]]
 }
 
+is_valid_key_name() {
+  [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]
+}
+
 validate_key_name() {
   local key="$1"
-  if [[ ! "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+  if ! is_valid_key_name "${key}"; then
     die "invalid key '${key}' — must be a valid env var name (letters, digits, underscores)"
   fi
 }
@@ -938,7 +1201,20 @@ resolve_secret_names() {
     done <<< "${manifest_entries}"
 
     if [[ ${#missing[@]} -gt 0 ]]; then
-      die "missing required secrets (listed in ${manifest_path}): ${missing[*]}"
+      local fetched fetch_status=0 still_missing=()
+      fetched="$(op_fetch_missing "${missing[@]}")" || fetch_status=$?
+      [[ "${fetch_status}" -ne "${SV_BACKEND_FAILURE_STATUS}" ]] || return "${fetch_status}"
+      for key in "${missing[@]}"; do
+        # shellcheck disable=SC2086 # fetched holds validated key names, one per line
+        if list_contains "${key}" ${fetched}; then
+          resolved+=("${key}")
+        else
+          still_missing+=("${key}")
+        fi
+      done
+      if [[ ${#still_missing[@]} -gt 0 ]]; then
+        die "missing required secrets (listed in ${manifest_path}): ${still_missing[*]}"
+      fi
     fi
 
     if [[ ${#resolved[@]} -gt 0 ]]; then
@@ -962,7 +1238,16 @@ resolve_secret_names() {
     done
 
     if [[ ${#missing[@]} -gt 0 ]]; then
-      die "missing requested secrets: ${missing[*]}"
+      local fetched fetch_status=0 still_missing=()
+      fetched="$(op_fetch_missing "${missing[@]}")" || fetch_status=$?
+      [[ "${fetch_status}" -ne "${SV_BACKEND_FAILURE_STATUS}" ]] || return "${fetch_status}"
+      for key in "${missing[@]}"; do
+        # shellcheck disable=SC2086 # fetched holds validated key names, one per line
+        list_contains "${key}" ${fetched} || still_missing+=("${key}")
+      done
+      if [[ ${#still_missing[@]} -gt 0 ]]; then
+        die "missing requested secrets: ${still_missing[*]}"
+      fi
     fi
     printf "%s\n" "$@"
     return
@@ -1030,6 +1315,86 @@ cmd_get() {
     [[ "${status}" -eq "${SV_BACKEND_FAILURE_STATUS}" ]] && return "${status}"
 
     die "secret not found: $key"
+  fi
+}
+
+cmd_sync() {
+  local key existing
+  local keys=()
+
+  for key in "$@"; do
+    [[ "${key}" != -* ]] || die "unknown sv sync option: ${key} (usage: sv sync [KEY...])"
+    validate_key_name "${key}"
+    for existing in "${keys[@]:-}"; do
+      [[ "${existing}" != "${key}" ]] || die "duplicate key: ${key}"
+    done
+    keys+=("${key}")
+  done
+
+  op_available || die "sv sync needs the 1Password CLI (op). Install it (macOS: brew install 1password-cli) and sign in, then retry."
+  store_require_ready
+  if op_prepare_auth; then
+    :
+  else
+    return $?
+  fi
+
+  local failures=0
+
+  if [[ ${#keys[@]} -eq 0 ]]; then
+    local titles title lower duplicates valid_titles=""
+    titles="$(op_list_titles)" || exit $?
+    if [[ -z "${titles}" ]]; then
+      printf "sv: no items found in 1Password vault '%s'\n" "${SV_OP_VAULT}" >&2
+      return 0
+    fi
+
+    while IFS= read -r title; do
+      if is_valid_key_name "${title}"; then
+        valid_titles+="${title}"$'\n'
+      else
+        printf "sv: skipping 1Password item '%s': its title is not a valid key name\n" "${title}" >&2
+      fi
+    done <<< "${titles}"
+
+    # 1Password matches references without regard to case, so titles that
+    # differ only in case cannot be read individually.
+    duplicates="$(printf "%s" "${valid_titles}" | tr '[:upper:]' '[:lower:]' | sort | uniq -d)"
+
+    while IFS= read -r title; do
+      [[ -n "${title}" ]] || continue
+      lower="$(printf "%s" "${title}" | tr '[:upper:]' '[:lower:]')"
+      if [[ -n "${duplicates}" ]] && printf "%s\n" "${duplicates}" | grep -qxF -- "${lower}"; then
+        printf "sv: skipping %s: more than one item in vault '%s' has this title (titles match without regard to case)\n" \
+          "${title}" "${SV_OP_VAULT}" >&2
+        failures=$((failures + 1))
+        continue
+      fi
+      keys+=("${title}")
+    done <<< "${valid_titles}"
+  fi
+
+  local index status
+  for ((index = 0; index < ${#keys[@]}; index++)); do
+    key="${keys[index]}"
+    if op_sync_key "${key}"; then
+      printf "sv: synced %s\n" "${key}" >&2
+    else
+      status=$?
+      failures=$((failures + 1))
+      if [[ "${status}" -eq "${SV_OP_TIMEOUT_STATUS}" ]]; then
+        local remaining=$(( ${#keys[@]} - index - 1 ))
+        if [[ ${remaining} -gt 0 ]]; then
+          printf "sv: op timed out; skipping the %d remaining key(s)\n" "${remaining}" >&2
+          failures=$((failures + remaining))
+        fi
+        break
+      fi
+    fi
+  done
+
+  if [[ ${failures} -gt 0 ]]; then
+    die "${failures} key(s) did not sync; their stored values are unchanged"
   fi
 }
 
@@ -1235,6 +1600,7 @@ Usage:
                              Run with exactly the named required secrets
   sv exec --all-secrets -- <cmd> [args]
                              Run with every stored secret (explicit legacy mode)
+  sv sync [KEY...]           Copy secrets from 1Password into the local store
   sv unlock <KEY>            Unlock Linux GPG agent without printing a secret
   sv doctor                  Check backend setup and common failures
   sv update                  Update sv to the latest version
@@ -1268,6 +1634,22 @@ Examples:
   sv exec --all-secrets -- legacy-command
   sv unlock OPENAI_API_KEY                # Linux: warm gpg-agent interactively
 
+1Password (optional):
+  Keep each secret in a 1Password vault named "sv", as an item titled with
+  the key name and the value in its "password" field. Then:
+
+    sv sync                  # copy every item in the vault
+    sv sync GH_TOKEN         # copy one key, e.g. after rotating it
+
+  When sv exec finds a required key missing, it reads that key from
+  1Password once and stores it. Optional keys are never fetched. Without the
+  op CLI, sv works exactly as before.
+
+  SV_OP_VAULT and SV_OP_FIELD change the vault and field. SV_OP_FETCH=0 turns
+  off the fetch in sv exec. sv stops waiting for op after
+  SV_OP_TIMEOUT_SECONDS (default 60). A service-account token stored with
+  'sv set OP_SERVICE_ACCOUNT_TOKEN' is passed only to op.
+
 Agent usage:
   Agents normally use manifest-scoped sv exec and must not guess transitive
   dependencies. For a confidently known dependency, use --key so the name is
@@ -1290,6 +1672,7 @@ shift || true
 case "$cmd" in
   set)        cmd_set "$@" ;;
   get)        cmd_get "$@" ;;
+  sync)       cmd_sync "$@" ;;
   unlock)     cmd_unlock "$@" ;;
   rm|remove)  cmd_rm "$@" ;;
   ls|list)    cmd_ls ;;

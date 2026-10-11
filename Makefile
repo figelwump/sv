@@ -2,9 +2,9 @@
 
 test: test-install
 	@if [ "$$(uname -s)" = "Darwin" ]; then \
-		bats test/exec.bats test/keychain.bats test/manifest.bats test/validation.bats; \
+		bats test/exec.bats test/keychain.bats test/manifest.bats test/op.bats test/validation.bats; \
 	elif [ "$$(uname -s)" = "Linux" ]; then \
-		bats test/exec.bats test/manifest.bats test/pass.bats test/validation.bats; \
+		bats test/exec.bats test/manifest.bats test/op.bats test/pass.bats test/validation.bats; \
 	else \
 		echo "sv tests only support macOS and Linux."; \
 		exit 1; \
